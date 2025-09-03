@@ -1,22 +1,50 @@
 
 from pathlib import Path
 import pandas as pd
+from src.ui.progress import wrap_iter, bar
 
-def read_tick_months(inputs_dir: str, symbol: str, months: list) -> pd.DataFrame:
+def read_tick_months(inputs_dir: str, symbol: str, months: list, yaml_cfg: dict = None, cli_disable: bool = False) -> pd.DataFrame:
+    """
+    Read per-month tick CSV files for a symbol.
+    Progress is shown per-month when enabled via config/flag.
+    """
     dfs = []
     symdir = Path(inputs_dir) / symbol
-    for m in months:
+    months_iter = wrap_iter(months, total=len(months), desc=f"Load {symbol}", yaml_cfg=yaml_cfg or {}, cli_disable=cli_disable)
+    for m in months_iter:
         fpath = symdir / f"{symbol}-ticks-{m}.csv"
         if fpath.exists():
-            df = pd.read_csv(fpath)
-            if "timestamp" not in df.columns or "price" not in df.columns:
-                raise ValueError(f"{fpath} missing required columns")
+            # Robust CSV load: tolerate truncated/bad rows and weird quoting.
+            # Expect columns: timestamp, price, qty, is_buyer_maker
+            try:
+                df = pd.read_csv(
+                    fpath,
+                    engine="python",
+                    on_bad_lines="skip",                 # pandas >= 1.3
+                    usecols=["timestamp", "price", "qty", "is_buyer_maker"],
+                )
+            except TypeError:
+                # Fallback for older pandas which uses error_bad_lines
+                df = pd.read_csv(
+                    fpath,
+                    engine="python",
+                    error_bad_lines=False,              # deprecated in newer pandas
+                    usecols=["timestamp", "price", "qty", "is_buyer_maker"],
+                )
+
+            # Hygiene: coerce dtypes and timestamps; drop malformed rows.
+            df["price"] = pd.to_numeric(df["price"], errors="coerce")
+            df["qty"]   = pd.to_numeric(df["qty"], errors="coerce")
+            # is_buyer_maker is 0/1; keep it small but safe
+            df["is_buyer_maker"] = pd.to_numeric(df["is_buyer_maker"], errors="coerce").fillna(0).astype("int8")
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True, errors="coerce")
+            df = df.dropna(subset=["timestamp", "price"]).sort_values("timestamp").reset_index(drop=True)
             dfs.append(df)
     if not dfs:
         raise FileNotFoundError(f"No tick CSVs found under {symdir} for months={months}")
     df = pd.concat(dfs, ignore_index=True)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.sort_values("timestamp")
+    # Already coerced to datetime and cleaned; ensure final global sort
+    df = df.sort_values("timestamp").reset_index(drop=True)
     return df
 
 def ticks_to_bars_1m(ticks: pd.DataFrame) -> pd.DataFrame:

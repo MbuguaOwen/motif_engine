@@ -9,7 +9,6 @@ from src.motifs.miner import sample_candidates, neighbor_density_pick, extract_s
 from src.motifs.matcher import ShapeletMatcher
 from src.engine.gating import composite_score
 from src.engine.risk import RiskManager
-from src.ui.progress import wrap_iter, progress_redirect_logs, bar
 
 def month_windows(months, train, test, step):
     out=[]; m=months
@@ -23,19 +22,17 @@ def build_feats(bars_1m, tf, atr_window):
     f=feature_frame(b, atr_win=atr_window); f["timestamp"]=b["timestamp"].iloc[-len(f):].values
     return f
 
-def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
+def run_fold(cfg, symbol, train_months, test_months):
     inputs_dir = cfg["paths"]["inputs_dir"]
     atr_win = cfg["bars"]["atr_window"]
 
-    # IO: month loading with optional progress
-    ticks = read_tick_months(inputs_dir, symbol, train_months + test_months, yaml_cfg=cfg, cli_disable=cli_disable)
+    ticks = read_tick_months(inputs_dir, symbol, train_months + test_months)
     bars_1m = ticks_to_bars_1m(ticks)
 
     feats = {h: build_feats(bars_1m, cfg["bars"][f"{h}_tf"], atr_win) for h in ["macro","meso","micro"]}
 
     def mask_by_months(df, months):
-        # Use .dt.strftime on Series, then convert to numpy for fast boolean masks
-        mstr = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m").to_numpy()
+        mstr = pd.to_datetime(df["timestamp"]).strftime("%Y-%m").values
         import numpy as np
         return np.isin(mstr, months)
 
@@ -51,17 +48,14 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
     micro["label"]=labels.values
 
     shapelets={}; discords={}
-    # Progress over horizons
-    for h in wrap_iter(["macro","meso","micro"], total=3, desc=f"Horizons[{symbol}]", yaml_cfg=cfg, cli_disable=cli_disable):
+    for h in ["macro","meso","micro"]:
         L = cfg["motifs"]["horizons"][h]["L"]
         stride = cfg["motifs"]["horizons"][h]["candidate_stride"]
         top_k = cfg["motifs"]["horizons"][h]["top_k"]
         series = feats[h]["ret_z"].values[masks[h]["train"]]
         cand = sample_candidates(series, L, stride)
         if len(cand)==0: raise RuntimeError(f"No candidates for {h}")
-        motif_idx, discord_idx, _ = neighbor_density_pick(series, L, cand, k=10, top_k=top_k,
-                                                          yaml_cfg=cfg, cli_disable=cli_disable,
-                                                          desc=f"Mine {h.upper()}@L={L}")
+        motif_idx, discord_idx, _ = neighbor_density_pick(series, L, cand, k=10, top_k=top_k)
         def extract(series, L, idxs): return [series[s:s+L].copy() for s in idxs]
         shapelets[h] = extract(series, L, motif_idx)
         discords[h] = extract(series, L, discord_idx)
@@ -94,12 +88,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
     cooldown=0
 
     results=[]
-    # Sim loop progress (per-bar)
-    sim_start = max(Ls.values())
-    sim_end = len(micro_test)-cfg["labels"]["timeout_bars_micro"]-2
-    sim_total = max(0, sim_end - sim_start)
-    sim_iter = wrap_iter(range(sim_start, sim_end), total=sim_total, desc=f"Sim {symbol}", yaml_cfg=cfg, cli_disable=cli_disable)
-    for i in sim_iter:
+    for i in range(max(Ls.values()), len(micro_test)-cfg["labels"]["timeout_bars_micro"]-2):
         if cooldown>0:
             cooldown-=1; continue
         ts = micro_test.loc[i, "timestamp"]
@@ -151,30 +140,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     ap.add_argument("--mode", choices=["walkforward"], default="walkforward")
-    ap.add_argument("--no-progress", action="store_true", help="Disable progress bars (overrides YAML ui.progress)")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config,"r"))
 
     months = cfg["engine"]["months"]
     folds = month_windows(months, cfg["engine"]["train_months"], cfg["engine"]["test_months"], cfg["engine"]["step_months"])
     outs=[]
-    # Ensure logs route through tqdm to avoid broken bars
-    with progress_redirect_logs(cfg, cli_disable=args.no_progress):
-        fold_iter = wrap_iter(list(enumerate(folds)), total=len(folds), desc="Folds", yaml_cfg=cfg, cli_disable=args.no_progress)
-        for i_fold, (train, test) in fold_iter:
-            syms = cfg["engine"]["symbols"]
-            sym_iter = wrap_iter(syms, total=len(syms), desc=f"Symbols (fold {i_fold})", yaml_cfg=cfg, cli_disable=args.no_progress)
-            for sym in sym_iter:
-                try:
-                    s = run_fold(cfg, sym, train, test, cli_disable=args.no_progress)
-                    print(s)
-                    outs.append(s)
-                except Exception as e:
-                    print(f"[WARN] {sym} {train}->{test} failed: {e}")
-        Path(cfg["paths"]["outputs_dir"]).mkdir(parents=True, exist_ok=True)
-        with open(Path(cfg["paths"]["outputs_dir"])/"walkforward_summaries.json","w") as f:
-            import json; json.dump(outs, f, indent=2)
-        print("DONE")
+    for sym in cfg["engine"]["symbols"]:
+        for train, test in folds:
+            try:
+                s = run_fold(cfg, sym, train, test)
+                print(s)
+                outs.append(s)
+            except Exception as e:
+                print(f"[WARN] {sym} {train}->{test} failed: {e}")
+    Path(cfg["paths"]["outputs_dir"]).mkdir(parents=True, exist_ok=True)
+    with open(Path(cfg["paths"]["outputs_dir"])/"walkforward_summaries.json","w") as f:
+        import json; json.dump(outs, f, indent=2)
+    print("DONE")
 
 if __name__ == "__main__":
     main()
+

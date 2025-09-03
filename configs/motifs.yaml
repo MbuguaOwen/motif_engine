@@ -12,8 +12,8 @@ engine:
   seed: 1337
 
 labels:
-  barrier_up_atr: 2.5
-  barrier_dn_atr: 1.0
+  barrier_up_atr: 120
+  barrier_dn_atr: 60
   timeout_bars_micro: 90
 
 bars:
@@ -57,7 +57,7 @@ gating:
   cooldown_bars: 20
 
 risk:
-  sl_mult: 8.0
+  sl_mult: 15.0
   tp_mult: 60.0
   be_at_R: 0.65
   tsl:
@@ -66,3 +66,8 @@ risk:
     arm_after_secs: 15
     min_secs_between_steps: 20
     quantize_price: true
+
+ui:
+  progress: true
+  progress_ascii: true
+  progress_mininterval: 0.2
