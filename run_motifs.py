@@ -23,7 +23,8 @@ def build_feats(bars_1m, tf, atr_window):
     f=feature_frame(b, atr_win=atr_window); f["timestamp"]=b["timestamp"].iloc[-len(f):].values
     return f
 
-def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
+def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False,
+             export_csv: bool = False, persist_artifacts: bool = False):
     inputs_dir = cfg["paths"]["inputs_dir"]
     atr_win = cfg["bars"]["atr_window"]
 
@@ -36,7 +37,6 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
     def mask_by_months(df, months):
         # Use .dt.strftime on Series, then convert to numpy for fast boolean masks
         mstr = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m").to_numpy()
-        import numpy as np
         return np.isin(mstr, months)
 
     masks = {h: {"train": mask_by_months(feats[h], train_months), "test": mask_by_months(feats[h], test_months)} for h in feats}
@@ -66,20 +66,23 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
         shapelets[h] = extract(series, L, motif_idx)
         discords[h] = extract(series, L, discord_idx)
 
+    from src.motifs.mass import mass
     matchers={}
+    epsilon={}
     for h in ["macro","meso","micro"]:
         keep = cfg["motifs"]["horizons"][h]["keep"]
-        # crude ε: median of pairwise MASS distances inside train
         train_series = feats[h]["ret_z"].values[masks[h]["train"]]
         dpool=[]
         for sh in shapelets[h]:
-            # Use sliding MASS distances within train
-            from src.motifs.mass import mass
             dprof = mass(sh, train_series)
-            dpool.append(dprof[np.isfinite(dprof)])
-        import numpy as np
+            if isinstance(dprof, np.ndarray):
+                dpool.append(dprof[np.isfinite(dprof)])
+            else:
+                dpool.append(np.asarray(dprof)[np.isfinite(dprof)])
         pool = np.concatenate(dpool) if dpool else np.array([1.0])
         eps = float(np.percentile(pool, 15))  # conservative (tight) by default
+        epsilon[h]=eps
+        print(f"ε[{h}]={eps}, kept={len(shapelets[h][:keep])}")
         matchers[h] = ShapeletMatcher([{"vec":sh, "eps":eps} for sh in shapelets[h][:keep]])
 
     risk = RiskManager(sl_mult=cfg["risk"]["sl_mult"], tp_mult=cfg["risk"]["tp_mult"], be_at_R=cfg["risk"]["be_at_R"], tsl=cfg["risk"]["tsl"])
@@ -145,6 +148,30 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
     outdir.mkdir(parents=True, exist_ok=True)
     with open(outdir/"trades.json","w") as f: import json; json.dump(results, f, indent=2)
     with open(outdir/"summary.json","w") as f: import json; json.dump(summary, f, indent=2)
+    if export_csv:
+        import json, pathlib
+        fold_dir = pathlib.Path(outdir)
+        trades_json = json.load(open(fold_dir / "trades.json","r"))
+        pd.DataFrame(trades_json).to_csv(fold_dir / "trades.csv", index=False)
+    if persist_artifacts:
+        import pickle, os, pathlib, json, time
+        fold_id = f"{symbol}_{train_months[-1]}__{test_months[0]}"
+        art_dir = pathlib.Path("artifacts") / fold_id
+        art_dir.mkdir(parents=True, exist_ok=True)
+        artifacts = {
+            "symbol": symbol,
+            "fold": {"train_end": str(train_months[-1]), "test_start": str(test_months[0])},
+            "horizons": {}
+        }
+        for h in ["macro","meso","micro"]:
+            artifacts["horizons"][h] = {
+                "L": int(cfg["motifs"]["horizons"][h]["L"]),
+                "shapelets": [np.asarray(s, dtype=float) for s in shapelets[h]],
+                "epsilon": float(epsilon[h]),
+            }
+        with open(art_dir / "shapelet_artifacts.pkl", "wb") as f:
+            pickle.dump(artifacts, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"[INFO] persisted artifacts to {art_dir / 'shapelet_artifacts.pkl'}")
     return summary
 
 def main():
@@ -152,6 +179,10 @@ def main():
     ap.add_argument("--config", required=True)
     ap.add_argument("--mode", choices=["walkforward"], default="walkforward")
     ap.add_argument("--no-progress", action="store_true", help="Disable progress bars (overrides YAML ui.progress)")
+    ap.add_argument("--export-csv", action="store_true",
+                    help="Export trades.csv per fold and walkforward_summaries.csv at the end.")
+    ap.add_argument("--persist-artifacts", action="store_true",
+                    help="Persist mined shapelets and epsilon per horizon to artifacts/ for reuse.")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config,"r"))
 
@@ -166,7 +197,8 @@ def main():
             sym_iter = wrap_iter(syms, total=len(syms), desc=f"Symbols (fold {i_fold})", yaml_cfg=cfg, cli_disable=args.no_progress)
             for sym in sym_iter:
                 try:
-                    s = run_fold(cfg, sym, train, test, cli_disable=args.no_progress)
+                    s = run_fold(cfg, sym, train, test, cli_disable=args.no_progress,
+                                 export_csv=args.export_csv, persist_artifacts=args.persist_artifacts)
                     print(s)
                     outs.append(s)
                 except Exception as e:
@@ -174,6 +206,12 @@ def main():
         Path(cfg["paths"]["outputs_dir"]).mkdir(parents=True, exist_ok=True)
         with open(Path(cfg["paths"]["outputs_dir"])/"walkforward_summaries.json","w") as f:
             import json; json.dump(outs, f, indent=2)
+        if args.export_csv:
+            import pandas as pd, json, pathlib
+            p = pathlib.Path(cfg["paths"]["outputs_dir"]) / "walkforward_summaries.json"
+            if p.exists():
+                df = pd.DataFrame(json.load(open(p, "r")))
+                df.to_csv(p.with_suffix(".csv"), index=False)
         print("DONE")
 
 if __name__ == "__main__":
