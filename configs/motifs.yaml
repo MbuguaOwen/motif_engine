@@ -1,0 +1,68 @@
+
+paths:
+  inputs_dir: "inputs"
+  outputs_dir: "outputs"
+
+engine:
+  symbols: ["BTCUSDT"]
+  months: ["2025-01","2025-02","2025-03","2025-04","2025-05","2025-06","2025-07"]
+  train_months: 3
+  test_months: 1
+  step_months: 1
+  seed: 1337
+
+labels:
+  barrier_up_atr: 2.5
+  barrier_dn_atr: 1.0
+  timeout_bars_micro: 90
+
+bars:
+  micro_tf: "1min"
+  meso_tf: "5min"
+  macro_tf: "15min"
+  atr_window: 50
+
+motifs:
+  horizons:
+    macro:
+      L: 40
+      top_k: 5
+      keep: 2
+      candidate_stride: 5
+      hit_eps_pct_range: [5, 25]
+      weight: 0.5
+      freshness_bars: 12
+    meso:
+      L: 60
+      top_k: 5
+      keep: 2
+      candidate_stride: 3
+      hit_eps_pct_range: [5, 25]
+      weight: 0.3
+      freshness_bars: 15
+    micro:
+      L: 30
+      top_k: 5
+      keep: 2
+      candidate_stride: 1
+      hit_eps_pct_range: [5, 25]
+      weight: 0.2
+      freshness_bars: 5
+
+gating:
+  require_macro: true
+  require_meso: true
+  require_micro: true
+  score_min: 0.70
+  cooldown_bars: 20
+
+risk:
+  sl_mult: 8.0
+  tp_mult: 60.0
+  be_at_R: 0.65
+  tsl:
+    atr_mult: 2.5
+    floor_from_median_mult: 1.1
+    arm_after_secs: 15
+    min_secs_between_steps: 20
+    quantize_price: true
