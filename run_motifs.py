@@ -42,7 +42,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable: bool = False):
     masks = {h: {"train": mask_by_months(feats[h], train_months), "test": mask_by_months(feats[h], test_months)} for h in feats}
 
     micro = feats["micro"].copy()
-    micro["atr"] = micro["atr"].fillna(method="bfill").fillna(method="ffill")
+    micro["atr"] = micro["atr"].bfill().ffill()
     labels = triple_barrier_labels(micro[["open","high","low","close","volume","atr"]].rename(columns={"atr":"atr"}),
                                    atr_col="atr",
                                    up_mult=cfg["labels"]["barrier_up_atr"],
