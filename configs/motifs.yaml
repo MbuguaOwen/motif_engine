@@ -12,8 +12,8 @@ engine:
   seed: 1337
 
 labels:
-  barrier_up_atr: 120
-  barrier_dn_atr: 60
+  barrier_up_atr: 80
+  barrier_dn_atr: 50
   timeout_bars_micro: 90
 
 bars:
