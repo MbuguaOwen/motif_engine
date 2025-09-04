@@ -2,3 +2,5 @@ numpy
 pandas
 pyyaml
 tqdm
+pyarrow
+fastparquet
