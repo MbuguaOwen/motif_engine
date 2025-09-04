@@ -1,5 +1,6 @@
 
 from pathlib import Path
+import logging
 import pandas as pd
 from src.ui.progress import wrap_iter, bar
 import zipfile
@@ -8,51 +9,44 @@ import zipfile
 
 
 def _read_single_kline_csv(path: Path) -> pd.DataFrame:
+    """Read a single Binance kline CSV (possibly inside a .zip).
+    Use first 6 columns and return standardized bars DF with inferred time unit.
+    Columns (Binance): open_time, open, high, low, close, volume, close_time, ...
     """
-    Read a single Binance kline CSV (possibly inside a .zip).
-    Use first 6 columns and return standardized bars DF.
-    """
-    names = [
-        "open_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "close_time",
-        "qav",
-        "trades",
-        "tb_base",
-        "tb_quote",
-        "ignore",
-    ]
-    usecols = ["open_time", "open", "high", "low", "close", "volume"]
+    names   = ["open_time","open","high","low","close","volume",
+               "close_time","qav","trades","tb_base","tb_quote","ignore"]
+    usecols = ["open_time","open","high","low","close","volume"]
+    dtypes  = {"open_time": "int64", "open": "float64", "high": "float64",
+               "low": "float64", "close": "float64", "volume": "float64"}
+
     if path.suffix.lower() == ".zip":
-        # Assume one CSV per zip; read it directly
         with zipfile.ZipFile(path) as z:
-            # pick the first *.csv
             inner = [n for n in z.namelist() if n.lower().endswith(".csv")]
             if not inner:
                 raise FileNotFoundError(f"No CSV inside {path}")
             with z.open(inner[0]) as f:
-                df = pd.read_csv(f, header=None, names=names, usecols=usecols)
+                df = pd.read_csv(f, header=None, names=names, usecols=usecols, dtype=dtypes)
     else:
-        # Plain CSV
-        df = pd.read_csv(path, header=None, names=names, usecols=usecols)
+        df = pd.read_csv(path, header=None, names=names, usecols=usecols, dtype=dtypes)
 
-    # Standardize
-    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    # --- Infer time unit from magnitude ---
+    # s  ~ 1e9      (e.g., 1735689600)
+    # ms ~ 1e12     (e.g., 1735689600000)
+    # us ~ 1e15     (e.g., 1735689600000000)  <-- your file
+    # ns ~ 1e18     (rare in public Binance dumps)
+    ts0 = int(df["open_time"].iloc[0])
+    if   ts0 > 1_000_000_000_000_000_000: unit = "ns"
+    elif ts0 >     1_000_000_000_000:     unit = "us"
+    elif ts0 >         1_000_000_000:     unit = "ms"
+    else:                                 unit = "s"
+
+    logging.getLogger(__name__).info("Parsed %s as %s timestamps", path.name, unit)
+
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit=unit, utc=True)
     df = df.drop(columns=["open_time"])
-    # Coerce numerics
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = (
-        df.dropna(subset=["timestamp", "open", "high", "low", "close"])
-        .drop_duplicates(subset=["timestamp"])
-        .sort_values("timestamp")
-        .reset_index(drop=True)
-    )
-    return df[["timestamp", "open", "high", "low", "close", "volume"]]
+    df = df.dropna(subset=["timestamp","open","high","low","close"]).drop_duplicates(subset=["timestamp"])
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    return df[["timestamp","open","high","low","close","volume"]]
 
 
 def read_kline_1m_months(
