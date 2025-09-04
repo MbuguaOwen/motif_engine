@@ -11,8 +11,8 @@ engine:
   step_months: 1
 
 labels:
-  barrier_up_atr: 50
-  barrier_dn_atr: 25
+  barrier_up_atr: 60     # mirror tp_mult
+  barrier_dn_atr: 8      # mirror sl_mult
   timeout_bars_micro: 180
 
 bars:
@@ -23,6 +23,35 @@ bars:
   micro_tf: "1min"
 
 motifs:
+  # Optional: fix the exact features & order used for multivariate windows
+  features:
+    - ret_z
+    - tsmom_slope_z
+    - atr
+    - atr_z
+    - atr_pct_price
+    - hv_ratio
+    - bb_width_pct
+    - impulse_score
+    - atr_med
+    - body_tr_ratio
+    - wick_upper_tr
+    - wick_lower_tr
+    - clv
+    - donchian_pos
+    - dist_to_don_hi_atr
+    - dist_to_don_lo_atr
+    - prior_break_up_cnt
+    - prior_break_dn_cnt
+    - bars_since_high
+    - bars_since_low
+    - pullback_from_high_pct
+    - pullup_from_low_pct
+    - trend_r2_w60
+    - adx_14
+    - kama_slope
+    - volume_z
+    - tick_imbalance
   horizons:
     macro:
       L: 40
@@ -54,10 +83,15 @@ gating:
   require_meso: true
   require_micro: true
   score_min: 0.70
+  pick_side: "argmax"      # "argmax" | "macro_sign"
+  bad_max: 0.60            # max allowed composite from BAD bank
+  alpha: 0.25              # weight on BAD in (S_good - alpha* S_bad)
+  margin_min: 0.05         # minimum (S_good - alpha * S_bad)
+  discord_block_min: 0.90  # if any horizon discord score >= this, block
   cooldown_bars: 20
 
 risk:
-  sl_mult: 15.0
+  sl_mult: 8.0
   tp_mult: 60.0
   be_at_R: 0.65
   tsl:

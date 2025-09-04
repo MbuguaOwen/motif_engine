@@ -10,8 +10,8 @@ from src.utils.io import (
 )
 from src.utils.indicators import feature_frame
 from src.labeling.triple_barrier import triple_barrier_labels
-from src.motifs.miner import sample_candidates, neighbor_density_pick, extract_shapelets
-from src.motifs.matcher import ShapeletMatcher
+from src.motifs.miner import sample_candidates, neighbor_density_pick
+from src.motifs.matcher import ShapeletMatcher, MultiShapeletMatcher  # NEW
 from src.engine.gating import composite_score
 from src.engine.risk import RiskManager
 from src.ui.progress import wrap_iter, progress_redirect_logs, bar
@@ -42,6 +42,35 @@ def load_parquet(path):
 
 def fold_id(symbol, train_months, test_months):
     return f"{symbol}_{train_months[-1]}__{test_months[0]}"
+
+# --- ADD configurable multivariate features (curate forward-safe set) ---
+FEATURES_FOR_MOTIFS_DEFAULT = [  # NEW: can be overridden by YAML
+    "ret_z","tsmom_slope_z","atr","atr_z","atr_pct_price","hv_ratio","bb_width_pct","impulse_score","atr_med",
+    "body_tr_ratio","wick_upper_tr","wick_lower_tr","clv",
+    "donchian_pos","dist_to_don_hi_atr","dist_to_don_lo_atr",
+    "prior_break_up_cnt","prior_break_dn_cnt","bars_since_high","bars_since_low",
+    "pullback_from_high_pct","pullup_from_low_pct",
+    "trend_r2_w60","adx_14","kama_slope",
+    "volume_z","tick_imbalance"
+]
+
+def _pick_features(df, cfg):  # NEW
+    # Allow YAML override: motifs.features: [...]
+    feats = (cfg.get("motifs", {}).get("features") or FEATURES_FOR_MOTIFS_DEFAULT)
+    feats = [c for c in feats if c in df.columns]  # drop missing
+    if not feats:
+        feats = ["ret_z"]  # last resort
+    return feats
+
+def _window_LF(df, end_row, L, cols):  # NEW
+    import numpy as np
+    s = end_row - L + 1
+    if s < 0: return None
+    W = df.iloc[s:end_row+1][cols].to_numpy(dtype=float)
+    return W if W.shape == (L, len(cols)) else None
+
+def _macro_sign_from_window(win_close):  # NEW
+    return 1 if (win_close[-1] - win_close[0]) >= 0 else -1
 
 # ---------- core fold run (unchanged simulation loop) ----------
 
@@ -107,11 +136,12 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
     )
     micro["tb_label"] = labels.values
     save_parquet(micro, Path(cfg["paths"]["outputs_dir"]) / "features" / f"{symbol}_micro.parquet")
+    feats["micro"] = micro
+    micro_full = micro
 
     # ----- Mining / ε -----
     shapelets = {}; epsilon = {}; matchers = {}
     if use_artifacts:
-        # Load pre-mined shapelets/eps
         import pickle
         art_dir = Path("artifacts") / fold_id(symbol, train_months, test_months)
         art_file = art_dir / "shapelet_artifacts.pkl"
@@ -119,14 +149,33 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             raise FileNotFoundError(f"Artifacts not found: {art_file}")
         with open(art_file, "rb") as f:
             arts = pickle.load(f)
-        for h in ["macro","meso","micro"]:
-            shapelets[h] = [np.asarray(x, dtype=float) for x in arts["horizons"][h]["shapelets"]]
-            epsilon[h] = float(arts["horizons"][h]["epsilon"])
-            matchers[h] = ShapeletMatcher([{"vec":s, "eps":epsilon[h]}
-                                           for s in shapelets[h][:cfg["motifs"]["horizons"][h]["keep"]]])
+        if "classes" in arts["horizons"]["macro"]:  # NEW schema
+            feats_list = arts.get("features", _pick_features(feats["micro"], cfg))
+            multi_shapelets = {h: {"long": {"good": [], "bad": []},
+                                   "short": {"good": [], "bad": []},
+                                   "discords": []} for h in ["macro", "meso", "micro"]}
+            epsilon = {h: {"long": {"good": None, "bad": None},
+                           "short": {"good": None, "bad": None},
+                           "discords": None} for h in ["macro", "meso", "micro"]}
+            for h in ["macro", "meso", "micro"]:
+                H = arts["horizons"][h]
+                for side in ["long", "short"]:
+                    for kind in ["good", "bad"]:
+                        epsilon[h][side][kind] = float(H["classes"][side][kind]["epsilon"])
+                        multi_shapelets[h][side][kind] = [np.asarray(W, dtype=float) for W in H["classes"][side][kind]["shapelets"]]
+                epsilon[h]["discords"] = float(H.get("discords", {}).get("epsilon", 1.0))
+                multi_shapelets[h]["discords"] = [np.asarray(W, dtype=float) for W in H.get("discords", {}).get("shapelets", [])]
+            # matchers built later in simulate section
+        else:
+            for h in ["macro", "meso", "micro"]:
+                shapelets[h] = [np.asarray(x, dtype=float) for x in arts["horizons"][h]["shapelets"]]
+                epsilon[h] = float(arts["horizons"][h]["epsilon"])
+                matchers[h] = ShapeletMatcher([{"vec": s, "eps": epsilon[h]}
+                                               for s in shapelets[h][:cfg["motifs"]["horizons"][h]["keep"]]])
+            feats_list = _pick_features(feats["micro"], cfg)
     else:
-        # Fresh mining from TRAIN months
-        for h in wrap_iter(["macro","meso","micro"], total=3, desc=f"Mine[{symbol}]", yaml_cfg=cfg, cli_disable=cli_disable):
+        motif_starts = {}
+        for h in wrap_iter(["macro", "meso", "micro"], total=3, desc=f"Mine[{symbol}]", yaml_cfg=cfg, cli_disable=cli_disable):
             L = cfg["motifs"]["horizons"][h]["L"]
             stride = cfg["motifs"]["horizons"][h]["candidate_stride"]
             top_k = cfg["motifs"]["horizons"][h]["top_k"]
@@ -138,35 +187,117 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                                                               k=10, top_k=top_k,
                                                               yaml_cfg=cfg, cli_disable=cli_disable,
                                                               desc=f"Mine {h}@L={L}")
-            shapelets[h] = [series[s:s+L].copy() for s in motif_idx]
-
-        # ε from pooled distances (15th pct)
-        from src.motifs.mass import mass
-        for h in ["macro","meso","micro"]:
-            keep = cfg["motifs"]["horizons"][h]["keep"]
-            train_series = feats[h]["ret_z"].values[masks[h]["train"]]
+            motif_starts[h] = motif_idx
+            shapelets[h] = [series[s:s+L].copy() for s in motif_idx]  # 1-D for now
+        from collections import defaultdict
+        multi_shapelets = {h: {"long": {"good": [], "bad": []},
+                               "short": {"good": [], "bad": []},
+                               "discords": []} for h in ["macro", "meso", "micro"]}
+        epsilon = {h: {"long": {"good": None, "bad": None},
+                       "short": {"good": None, "bad": None},
+                       "discords": None} for h in ["macro", "meso", "micro"]}
+        micro_map = dict(zip(micro_full["timestamp"].astype(str), micro["tb_label"].astype(int)))
+        feats_list = _pick_features(feats["micro"], cfg)
+        for h in ["macro", "meso", "micro"]:
+            L = cfg["motifs"]["horizons"][h]["L"]
+            feats_h = feats[h].reset_index(drop=True)
+            idx_train = np.where(masks[h]["train"])[0]
+            for s in motif_starts[h]:
+                end_row = idx_train[s + L - 1]
+                ts = str(feats_h.loc[end_row, "timestamp"])
+                tb = int(micro_map.get(ts, 0))
+                close_win = feats_h["close"].iloc[end_row-L+1:end_row+1].to_numpy(float)
+                msign = _macro_sign_from_window(close_win)
+                if tb == 0:
+                    pass
+                elif tb == 1 and msign > 0:
+                    cls = ("long", "good")
+                elif tb == -1 and msign < 0:
+                    cls = ("short", "good")
+                elif tb == -1 and msign > 0:
+                    cls = ("long", "bad")
+                elif tb == 1 and msign < 0:
+                    cls = ("short", "bad")
+                else:
+                    continue
+                W = _window_LF(feats_h, end_row, L, feats_list)
+                if W is None or not np.isfinite(W).all():
+                    continue
+                multi_shapelets[h][cls[0]][cls[1]].append(W)
+            if 'discord_idx' in locals():
+                for s in discord_idx:
+                    end_row = idx_train[s + L - 1]
+                    Wd = _window_LF(feats_h, end_row, L, feats_list)
+                    if Wd is not None and np.isfinite(Wd).all():
+                        multi_shapelets[h]["discords"].append(Wd)
+        from src.motifs.mass import zdist_multi
+        def _cal_eps(h, side, kind):
+            mats = multi_shapelets[h][side][kind]
+            if not mats:
+                return 1.0
+            feats_h = feats[h].reset_index(drop=True)
+            L = cfg["motifs"]["horizons"][h]["L"]
+            end_rows = []
+            idx_train = np.where(masks[h]["train"])[0]
+            for e in idx_train:
+                if e < L-1: continue
+                ts = str(feats_h.loc[e, "timestamp"])
+                tb = int(micro_map.get(ts, 0))
+                close_win = feats_h["close"].iloc[e-L+1:e+1].to_numpy(float)
+                msign = _macro_sign_from_window(close_win)
+                cls = None
+                if tb == 1 and msign > 0: cls=("long","good")
+                elif tb == -1 and msign < 0: cls=("short","good")
+                elif tb == -1 and msign > 0: cls=("long","bad")
+                elif tb == 1 and msign < 0: cls=("short","bad")
+                if cls == (side, kind):
+                    end_rows.append(e)
+            if len(end_rows) > 5000:
+                end_rows = end_rows[::max(1, len(end_rows)//5000)]
             dpool = []
-            for sh in shapelets[h]:
-                dprof = mass(sh, train_series)
-                arr = np.asarray(dprof)[np.isfinite(dprof)]
-                if len(arr): dpool.append(arr)
-            pool = np.concatenate(dpool) if dpool else np.array([1.0])
-            eps = float(np.percentile(pool, 15))
-            epsilon[h] = eps
-            matchers[h] = ShapeletMatcher([{"vec":sh, "eps":eps} for sh in shapelets[h][:keep]])
+            for mat in mats:
+                for e in end_rows:
+                    W = _window_LF(feats_h, e, L, feats_list)
+                    if W is None or not np.isfinite(W).all():
+                        continue
+                    dpool.append(zdist_multi(mat, W))
+            return float(np.percentile(np.asarray(dpool), 15)) if dpool else 1.0
+        for h in ["macro", "meso", "micro"]:
+            for side in ["long", "short"]:
+                for kind in ["good", "bad"]:
+                    epsilon[h][side][kind] = _cal_eps(h, side, kind)
+            if multi_shapelets[h]["discords"]:
+                epsilon[h]["discords"] = np.percentile(
+                    [zdist_multi(m, m) for m in multi_shapelets[h]["discords"]], 15
+                ) if multi_shapelets[h]["discords"] else 1.0
 
-    # If this run is just “mine”, persist and exit early
+    # --- UPDATE artifact persist to store features + banks (handle persist_artifacts + mine mode) ---
     if persist_artifacts and cfg.get("_phase") == "mine":
         import pickle, pathlib
         art_dir = pathlib.Path("artifacts") / fold_id(symbol, train_months, test_months)
         art_dir.mkdir(parents=True, exist_ok=True)
         artifacts = {"symbol": symbol,
                      "fold": {"train_end": str(train_months[-1]), "test_start": str(test_months[0])},
+                     "features": feats_list,
                      "horizons": {}}
-        for h in ["macro","meso","micro"]:
-            artifacts["horizons"][h] = {"L": int(cfg["motifs"]["horizons"][h]["L"]),
-                                        "shapelets": [np.asarray(s, dtype=float) for s in shapelets[h]],
-                                        "epsilon": float(epsilon[h])}
+        for h in ["macro", "meso", "micro"]:
+            artifacts["horizons"][h] = {
+                "L": int(cfg["motifs"]["horizons"][h]["L"]),
+                "classes": {
+                    "long":  {"good": {"epsilon": float(epsilon[h]["long"]["good"]),
+                                         "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["long"]["good"]]},
+                               "bad":  {"epsilon": float(epsilon[h]["long"]["bad"]),
+                                         "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["long"]["bad"]]}},
+                    "short": {"good": {"epsilon": float(epsilon[h]["short"]["good"]),
+                                         "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["short"]["good"]]},
+                               "bad":  {"epsilon": float(epsilon[h]["short"]["bad"]),
+                                         "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["short"]["bad"]]}},
+                },
+                "discords": {
+                    "epsilon": float(epsilon[h].get("discords") or 1.0),
+                    "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["discords"]]
+                }
+            }
         with open(art_dir / "shapelet_artifacts.pkl", "wb") as f:
             pickle.dump(artifacts, f, protocol=pickle.HIGHEST_PROTOCOL)
         print(f"[INFO] persisted artifacts to {art_dir / 'shapelet_artifacts.pkl'}")
@@ -185,6 +316,33 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
     weights = {h: cfg["motifs"]["horizons"][h]["weight"] for h in ["macro","meso","micro"]}
     score_min = cfg["gating"]["score_min"]; cooldown_bars = cfg["gating"]["cooldown_bars"]; cooldown = 0
 
+    feats_list = _pick_features(feats["micro"], cfg)  # ensure defined
+    class_matchers = {"long": {}, "short": {}, "discords": {}}
+    if 'multi_shapelets' in locals():
+        for h in ["macro", "meso", "micro"]:
+            class_matchers["long"][h] = {
+                "good": MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["long"]["good"]} for m in multi_shapelets[h]["long"]["good"]]),
+                "bad":  MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["long"]["bad"]}  for m in multi_shapelets[h]["long"]["bad"]]),
+            }
+            class_matchers["short"][h] = {
+                "good": MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["short"]["good"]} for m in multi_shapelets[h]["short"]["good"]]),
+                "bad":  MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["short"]["bad"]}  for m in multi_shapelets[h]["short"]["bad"]]),
+            }
+            class_matchers["discords"][h] = MultiShapeletMatcher(
+                [{"mat": m, "eps": (epsilon[h]["discords"] or 1.0)} for m in multi_shapelets[h]["discords"]]
+            )
+
+    def slice_LF_asof(df, ts, L, cols):
+        d = df[df["timestamp"] <= ts]
+        if len(d) < L: return None
+        return d.iloc[-L:][cols].to_numpy(dtype=float)
+
+    bad_max = float(cfg.get("gating", {}).get("bad_max", 0.60))
+    alpha = float(cfg.get("gating", {}).get("alpha", 0.25))
+    margin_min = float(cfg.get("gating", {}).get("margin_min", 0.05))
+    pick_side = cfg.get("gating", {}).get("pick_side", "argmax")
+    discord_block_min = cfg.get("gating", {}).get("discord_block_min", 0.9)
+
     results = []
     sim_start = max(Ls.values())
     sim_end = len(micro_test) - cfg["labels"]["timeout_bars_micro"] - 2
@@ -193,34 +351,74 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                          yaml_cfg=cfg, cli_disable=cli_disable)
     for i in sim_iter:
         if cooldown > 0:
-            cooldown -= 1; continue
+            cooldown -= 1
+            continue
         ts = micro_test.loc[i, "timestamp"]
 
-        def slice_asof(df, L):
-            d = df[df["timestamp"] <= ts]
-            return None if len(d) < L else d.iloc[-L:]
-
-        wins = {"micro": slice_asof(micro_full, Ls["micro"]),
-                "meso":  slice_asof(meso_full,  Ls["meso"]),
-                "macro": slice_asof(macro_full, Ls["macro"])}
+        wins = {
+            "micro": slice_LF_asof(micro_full, ts, Ls["micro"], feats_list),
+            "meso":  slice_LF_asof(meso_full,  ts, Ls["meso"],  feats_list),
+            "macro": slice_LF_asof(macro_full, ts, Ls["macro"], feats_list),
+        }
         if any(v is None for v in wins.values()):
             continue
 
-        scores = {}; hits = {}
-        for h in ["macro","meso","micro"]:
-            svec = wins[h]["ret_z"].values
-            score, hit = matchers[h].match_score(svec)
-            scores[h] = score; hits[h] = hit
-        if not (hits["macro"] and hits["meso"] and hits["micro"]):
-            continue
+        if 'class_matchers' in locals() and class_matchers["long"]:
+            scores_long_good = {h: class_matchers["long"][h]["good"].match_score(wins[h])[0]  for h in ["macro", "meso", "micro"]}
+            scores_short_good = {h: class_matchers["short"][h]["good"].match_score(wins[h])[0] for h in ["macro", "meso", "micro"]}
+            scores_long_bad = {h: class_matchers["long"][h]["bad"].match_score(wins[h])[0]   for h in ["macro", "meso", "micro"]}
+            scores_short_bad = {h: class_matchers["short"][h]["bad"].match_score(wins[h])[0]  for h in ["macro", "meso", "micro"]}
 
-        S = composite_score(scores["macro"], scores["meso"], scores["micro"],
-                            wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
-        if S < score_min:
-            continue
+            Sg_long = composite_score(scores_long_good["macro"], scores_long_good["meso"], scores_long_good["micro"],
+                                      wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
+            Sg_short = composite_score(scores_short_good["macro"], scores_short_good["meso"], scores_short_good["micro"],
+                                       wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
+            Sb_long = composite_score(scores_long_bad["macro"], scores_long_bad["meso"], scores_long_bad["micro"],
+                                      wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
+            Sb_short = composite_score(scores_short_bad["macro"], scores_short_bad["meso"], scores_short_bad["micro"],
+                                       wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
 
-        mac = wins["macro"]["close"].values
-        side = "long" if mac[-1] - mac[0] > 0 else "short"
+            if pick_side == "argmax":
+                if Sg_long >= Sg_short:
+                    side, Sg, Sb = "long", Sg_long, Sb_long
+                else:
+                    side, Sg, Sb = "short", Sg_short, Sb_short
+            else:
+                mac_close = macro_full[macro_full["timestamp"] <= ts]["close"].tail(Ls["macro"]).to_numpy(float)
+                side = "long" if mac_close[-1] - mac_close[0] >= 0 else "short"
+                Sg = Sg_long if side == "long" else Sg_short
+                Sb = Sb_long if side == "long" else Sb_short
+
+            block_by_discord = False
+            if class_matchers["discords"]:
+                Sd = [class_matchers["discords"][h].match_score(wins[h])[0] for h in ["macro", "meso", "micro"]]
+                block_by_discord = max(Sd) >= discord_block_min
+
+            if (Sg < score_min) or (Sb >= bad_max) or ((Sg - alpha * Sb) < margin_min) or block_by_discord:
+                continue
+        else:
+            def slice_asof_df(df, L):
+                d = df[df["timestamp"] <= ts]
+                return None if len(d) < L else d.iloc[-L:]
+            wins_df = {"micro": slice_asof_df(micro_full, Ls["micro"]),
+                       "meso":  slice_asof_df(meso_full,  Ls["meso"]),
+                       "macro": slice_asof_df(macro_full, Ls["macro"])}
+            if any(v is None for v in wins_df.values()):
+                continue
+            scores = {}; hits = {}
+            for h in ["macro", "meso", "micro"]:
+                svec = wins_df[h]["ret_z"].values
+                score, hit = matchers[h].match_score(svec)
+                scores[h] = score; hits[h] = hit
+            if not (hits["macro"] and hits["meso"] and hits["micro"]):
+                continue
+            Sg = composite_score(scores["macro"], scores["meso"], scores["micro"],
+                                 wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
+            if Sg < score_min:
+                continue
+            Sb = 0.0
+            mac_close_df = wins_df["macro"]["close"].values
+            side = "long" if mac_close_df[-1] - mac_close_df[0] > 0 else "short"
 
         entry = float(micro_test.loc[i, "close"])
         atr_entry = float(micro_test.loc[i, "atr"])
