@@ -2,7 +2,12 @@ import argparse, json
 from pathlib import Path
 import numpy as np, pandas as pd, yaml
 
-from src.utils.io import read_tick_months, ticks_to_bars_1m, resample_bars
+from src.utils.io import (
+    read_kline_1m_months,
+    read_tick_months,
+    ticks_to_bars_1m,
+    resample_bars,
+)
 from src.utils.indicators import feature_frame
 from src.labeling.triple_barrier import triple_barrier_labels
 from src.motifs.miner import sample_candidates, neighbor_density_pick, extract_shapelets
@@ -44,13 +49,29 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
              export_csv=False, persist_artifacts=False, use_artifacts=False):
     atr_win = cfg["bars"]["atr_window"]
 
-    # ----- Inputs: either cached bars or build from ticks -----
+    # ----- Inputs: bars from inputs/ (new) or cached/build (legacy) -----
+    src = cfg["bars"].get("source", "cache_or_build")  # "inputs_1m" | "cache_or_build"
     bars_file = Path(cfg["paths"]["outputs_dir"]) / "bars" / f"{symbol}.parquet"
-    if bars_file.exists():
+
+    if src == "inputs_1m":
+        bars_1m = read_kline_1m_months(
+            cfg["paths"]["inputs_dir"],
+            symbol,
+            train_months + test_months,
+            yaml_cfg=cfg,
+            cli_disable=cli_disable,
+        )
+    elif bars_file.exists():
         bars_1m = load_parquet(bars_file)
     else:
-        ticks = read_tick_months(cfg["paths"]["inputs_dir"], symbol, train_months + test_months,
-                                 yaml_cfg=cfg, cli_disable=cli_disable)
+        # legacy: build from ticks if present
+        ticks = read_tick_months(
+            cfg["paths"]["inputs_dir"],
+            symbol,
+            train_months + test_months,
+            yaml_cfg=cfg,
+            cli_disable=cli_disable,
+        )
         bars_1m = ticks_to_bars_1m(ticks)
 
     # ----- Features: either cached or compute -----
@@ -271,24 +292,44 @@ def main():
 
         elif args.mode == "features":
             # Requires bars; builds & caches features per horizon
-            sym_iter = wrap_iter(cfg["engine"]["symbols"], total=len(cfg["engine"]["symbols"]),
-                                 desc="Features: symbols", yaml_cfg=cfg, cli_disable=args.no_progress)
+            sym_iter = wrap_iter(
+                cfg["engine"]["symbols"],
+                total=len(cfg["engine"]["symbols"]),
+                desc="Features: symbols",
+                yaml_cfg=cfg,
+                cli_disable=args.no_progress,
+            )
             for sym in sym_iter:
-                bars_1m = load_parquet(bars_dir / f"{sym}.parquet")
-                for h, tf in [("macro", cfg["bars"]["macro_tf"]),
-                              ("meso",  cfg["bars"]["meso_tf"]),
-                              ("micro", cfg["bars"]["micro_tf"])]:
+                # Ensure bars parquet exists even when source is inputs_1m
+                if cfg["bars"].get("source") == "inputs_1m":
+                    bars_1m = read_kline_1m_months(
+                        cfg["paths"]["inputs_dir"],
+                        sym,
+                        months,
+                        yaml_cfg=cfg,
+                        cli_disable=args.no_progress,
+                    )
+                    save_parquet(bars_1m, bars_dir / f"{sym}.parquet")
+                else:
+                    bars_1m = load_parquet(bars_dir / f"{sym}.parquet")
+
+                for h, tf in [
+                    ("macro", cfg["bars"]["macro_tf"]),
+                    ("meso", cfg["bars"]["meso_tf"]),
+                    ("micro", cfg["bars"]["micro_tf"]),
+                ]:
                     f = build_feats(bars_1m, tf, cfg["bars"]["atr_window"])
                     save_parquet(f, feats_dir / f"{sym}_{h}.parquet")
-                # Also compute & store micro triple-barrier labels for inspection
+
+                # Triple-barrier labels on micro (unchanged logic)
                 micro = load_parquet(feats_dir / f"{sym}_micro.parquet")
                 micro["atr"] = micro["atr"].bfill().ffill()
                 micro["tb_label"] = triple_barrier_labels(
-                    micro[["open","high","low","close","volume","atr"]],
+                    micro[["open", "high", "low", "close", "volume", "atr"]],
                     atr_col="atr",
                     up_mult=cfg["labels"]["barrier_up_atr"],
                     dn_mult=cfg["labels"]["barrier_dn_atr"],
-                    timeout_bars=cfg["labels"]["timeout_bars_micro"]
+                    timeout_bars=cfg["labels"]["timeout_bars_micro"],
                 ).values
                 save_parquet(micro, feats_dir / f"{sym}_micro.parquet")
 

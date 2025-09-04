@@ -4,23 +4,23 @@ paths:
   outputs_dir: "outputs"
 
 engine:
-  symbols: ["BTCUSDT"]
+  symbols: ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
   months: ["2025-01","2025-02","2025-03","2025-04","2025-05","2025-06","2025-07"]
   train_months: 3
   test_months: 1
   step_months: 1
-  seed: 1337
 
 labels:
-  barrier_up_atr: 80
-  barrier_dn_atr: 50
-  timeout_bars_micro: 90
+  barrier_up_atr: 60
+  barrier_dn_atr: 8
+  timeout_bars_micro: 180
 
 bars:
-  micro_tf: "1min"
-  meso_tf: "5min"
-  macro_tf: "15min"
+  source: "inputs_1m"
   atr_window: 50
+  macro_tf: "60min"
+  meso_tf: "15min"
+  micro_tf: "1min"
 
 motifs:
   horizons:
