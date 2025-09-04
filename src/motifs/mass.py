@@ -36,3 +36,17 @@ def zdist(a, b):
     a = (a - a.mean()) / (a.std() + 1e-12)
     b = (b - b.mean()) / (b.std() + 1e-12)
     return np.linalg.norm(a - b)
+
+
+def zdist_multi(A, B):
+    """
+    Column-wise z-normalized L2 distance for multivariate windows.
+    A, B: shape (L, F) numpy arrays.
+    """
+    import numpy as np
+    A = np.asarray(A, dtype=float); B = np.asarray(B, dtype=float)
+    if A.shape != B.shape:
+        return float("inf")
+    A = (A - A.mean(axis=0, keepdims=True)) / (A.std(axis=0, keepdims=True) + 1e-12)
+    B = (B - B.mean(axis=0, keepdims=True)) / (B.std(axis=0, keepdims=True) + 1e-12)
+    return float(np.linalg.norm(A - B))
