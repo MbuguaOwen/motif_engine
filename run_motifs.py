@@ -58,15 +58,16 @@ def _pick_features(df, cfg):  # NEW
     # Allow YAML override: motifs.features: [...]
     feats = (cfg.get("motifs", {}).get("features") or FEATURES_FOR_MOTIFS_DEFAULT)
     feats = [c for c in feats if c in df.columns]  # drop missing
-    if not feats:
+    if len(feats) == 0:
         feats = ["ret_z"]  # last resort
     return feats
 
 def _window_LF(df, end_row, L, cols):  # NEW
-    import numpy as np
     s = end_row - L + 1
-    if s < 0: return None
+    if s < 0:
+        return None
     W = df.iloc[s:end_row+1][cols].to_numpy(dtype=float)
+    # explicit shape check (never rely on array truthiness)
     return W if W.shape == (L, len(cols)) else None
 
 def _macro_sign_from_window(win_close):  # NEW
@@ -118,8 +119,12 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
 
     # ----- Month masks -----
     def mask_by_months(df, months):
-        mstr = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m").to_numpy()
-        return np.isin(mstr, months)
+        """
+        Return a numpy[bool] mask selecting rows whose timestamp month is in `months`.
+        Uses pandas .isin and returns a real boolean array (no ambiguous truthiness).
+        """
+        m = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m")
+        return m.isin(pd.Index(months)).to_numpy(dtype=bool)
 
     masks = {h: {"train": mask_by_months(feats[h], train_months),
                  "test":  mask_by_months(feats[h], test_months)} for h in feats}
@@ -215,6 +220,8 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             L = cfg["motifs"]["horizons"][h]["L"]
             feats_h = feats[h].reset_index(drop=True)
             idx_train = np.where(masks[h]["train"])[0]
+            if len(idx_train) < L:
+                continue
 
             # ---- Motifs → multivariate windows with guards ----
             for s in motif_starts[h]:
@@ -257,23 +264,30 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         from src.motifs.mass import zdist_multi
         def _cal_eps(h, side, kind):
             mats = multi_shapelets[h][side][kind]
-            if not mats:
+            if len(mats) == 0:
                 return 1.0
             feats_h = feats[h].reset_index(drop=True)
             L = cfg["motifs"]["horizons"][h]["L"]
             end_rows = []
             idx_train = np.where(masks[h]["train"])[0]
+            if len(idx_train) < L:
+                return 1.0  # not enough bars to calibrate
             for e in idx_train:
-                if e < L-1: continue
+                if e < L-1:
+                    continue
                 ts = str(feats_h.loc[e, "timestamp"])
                 tb = int(micro_map.get(ts, 0))
                 close_win = feats_h["close"].iloc[e-L+1:e+1].to_numpy(float)
                 msign = _macro_sign_from_window(close_win)
                 cls = None
-                if tb == 1 and msign > 0: cls=("long","good")
-                elif tb == -1 and msign < 0: cls=("short","good")
-                elif tb == -1 and msign > 0: cls=("long","bad")
-                elif tb == 1 and msign < 0: cls=("short","bad")
+                if tb == 1 and msign > 0:
+                    cls=("long","good")
+                elif tb == -1 and msign < 0:
+                    cls=("short","good")
+                elif tb == -1 and msign > 0:
+                    cls=("long","bad")
+                elif tb == 1 and msign < 0:
+                    cls=("short","bad")
                 if cls == (side, kind):
                     end_rows.append(e)
             if len(end_rows) > 5000:
@@ -282,16 +296,16 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             for mat in mats:
                 for e in end_rows:
                     W = _window_LF(feats_h, e, L, feats_list)
-                    if W is None or not np.isfinite(W).all():
+                    if (W is None) or (not np.isfinite(W).all()):
                         continue
                     dpool.append(zdist_multi(mat, W))
-            return float(np.percentile(np.asarray(dpool), 15)) if dpool else 1.0
+            return float(np.percentile(np.asarray(dpool), 15)) if len(dpool) > 0 else 1.0
 
         for h in ["macro","meso","micro"]:
             for side in ["long","short"]:
                 for kind in ["good","bad"]:
                     epsilon[h][side][kind] = _cal_eps(h, side, kind)
-            if multi_shapelets[h]["discords"]:
+            if len(multi_shapelets[h]["discords"]) > 0:
                 epsilon[h]["discords"] = 1.0  # keep loose or compute if desired
 
     # --- UPDATE artifact persist to store features + banks (handle persist_artifacts + mine mode) ---
@@ -366,6 +380,12 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
     pick_side = cfg.get("gating", {}).get("pick_side", "argmax")
     discord_block_min = cfg.get("gating", {}).get("discord_block_min", 0.9)
 
+    def _assert_scalar(*vals):
+        for v in vals:
+            if isinstance(v, (np.ndarray, pd.Series)):
+                assert v.ndim == 0 or v.size == 1, f"Expected scalar, got shape={getattr(v,'shape',None)}"
+        return tuple(float(np.asarray(v).reshape(-1)[0]) if isinstance(v, (np.ndarray, pd.Series)) else v for v in vals)
+
     results = []
     sim_start = max(Ls.values())
     sim_end = len(micro_test) - cfg["labels"]["timeout_bars_micro"] - 2
@@ -386,7 +406,8 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         if any(v is None for v in wins.values()):
             continue
 
-        if 'class_matchers' in locals() and class_matchers["long"]:
+        has_long = ('class_matchers' in locals()) and (len(class_matchers.get("long", {})) > 0)
+        if has_long:
             scores_long_good = {h: class_matchers["long"][h]["good"].match_score(wins[h])[0]  for h in ["macro", "meso", "micro"]}
             scores_short_good = {h: class_matchers["short"][h]["good"].match_score(wins[h])[0] for h in ["macro", "meso", "micro"]}
             scores_long_bad = {h: class_matchers["long"][h]["bad"].match_score(wins[h])[0]   for h in ["macro", "meso", "micro"]}
@@ -411,11 +432,15 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                 side = "long" if mac_close[-1] - mac_close[0] >= 0 else "short"
                 Sg = Sg_long if side == "long" else Sg_short
                 Sb = Sb_long if side == "long" else Sb_short
+            Sg, Sb = _assert_scalar(Sg, Sb)
 
+            has_discords = (len(class_matchers.get("discords", {})) > 0) and any(
+                hasattr(class_matchers["discords"].get(h, None), "match_score") for h in ["macro", "meso", "micro"]
+            )
             block_by_discord = False
-            if class_matchers["discords"]:
+            if has_discords:
                 Sd = [class_matchers["discords"][h].match_score(wins[h])[0] for h in ["macro", "meso", "micro"]]
-                block_by_discord = max(Sd) >= discord_block_min
+                block_by_discord = (len(Sd) > 0) and (max(Sd) >= discord_block_min)
 
             if (Sg < score_min) or (Sb >= bad_max) or ((Sg - alpha * Sb) < margin_min) or block_by_discord:
                 continue
@@ -442,6 +467,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             Sb = 0.0
             mac_close_df = wins_df["macro"]["close"].values
             side = "long" if mac_close_df[-1] - mac_close_df[0] > 0 else "short"
+            Sg, Sb = _assert_scalar(Sg, Sb)
 
         entry = float(micro_test.loc[i, "close"])
         atr_entry = float(micro_test.loc[i, "atr"])
@@ -460,9 +486,9 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
 
     R_list = [x["R"] for x in results]
     summary = {"symbol": symbol, "train_months": train_months, "test_months": test_months,
-               "trades": len(results), "sum_R": float(np.sum(R_list) if R_list else 0.0),
-               "avg_R": float(np.mean(R_list) if R_list else 0.0),
-               "median_R": float(np.median(R_list) if R_list else 0.0)}
+               "trades": len(results), "sum_R": float(np.sum(R_list) if len(R_list) > 0 else 0.0),
+               "avg_R": float(np.mean(R_list) if len(R_list) > 0 else 0.0),
+               "median_R": float(np.median(R_list) if len(R_list) > 0 else 0.0)}
 
     outdir = Path(cfg["paths"]["outputs_dir"]) / fold_id(symbol, train_months, test_months)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -487,12 +513,17 @@ def main():
                     help="Persist mined shapelets and epsilon per horizon to artifacts/ for reuse.")
     ap.add_argument("--use-artifacts", action="store_true",
                     help="Load previously persisted shapelets/epsilon and skip mining.")
+    ap.add_argument("--fold", type=int, default=None, help="Run only this walk-forward fold (0-based).")
     args = ap.parse_args()
     cfg = yaml.safe_load(open(args.config, "r"))
 
     months = cfg["engine"]["months"]
     folds = month_windows(months, cfg["engine"]["train_months"],
                           cfg["engine"]["test_months"], cfg["engine"]["step_months"])
+    if args.fold is not None:
+        if args.fold < 0 or args.fold >= len(folds):
+            raise SystemExit(f"--fold out of range (0..{len(folds)-1})")
+        folds = [folds[args.fold]]
     outs = []
 
     bars_dir = Path(cfg["paths"]["outputs_dir"]) / "bars"
@@ -559,6 +590,7 @@ def main():
             fold_iter = wrap_iter(list(enumerate(folds)), total=len(folds),
                                   desc="Folds", yaml_cfg=cfg, cli_disable=args.no_progress)
             for i_fold, (train, test) in fold_iter:
+                print(f"[INFO] Fold {i_fold}: train={train} test={test}")
                 sym_iter = wrap_iter(cfg["engine"]["symbols"], total=len(cfg["engine"]["symbols"]),
                                      desc=f"Symbols (fold {i_fold})", yaml_cfg=cfg, cli_disable=args.no_progress)
                 for sym in sym_iter:
