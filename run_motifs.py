@@ -318,6 +318,12 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                      "features": feats_list,
                      "horizons": {}}
         for h in ["macro", "meso", "micro"]:
+            _eps_disc = epsilon[h].get("discords", None)
+            if _eps_disc is None:
+                _eps_disc = 1.0
+            else:
+                # robustly coerce any numpy scalar/array-like to a python float
+                _eps_disc = float(np.asarray(_eps_disc).reshape(()).item())
             artifacts["horizons"][h] = {
                 "L": int(cfg["motifs"]["horizons"][h]["L"]),
                 "classes": {
@@ -331,7 +337,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                                          "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["short"]["bad"]]}},
                 },
                 "discords": {
-                    "epsilon": float(epsilon[h].get("discords") or 1.0),
+                    "epsilon": _eps_disc,
                     "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["discords"]]
                 }
             }
@@ -365,8 +371,13 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                 "good": MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["short"]["good"]} for m in multi_shapelets[h]["short"]["good"]]),
                 "bad":  MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["short"]["bad"]}  for m in multi_shapelets[h]["short"]["bad"]]),
             }
+            _eps_disc = epsilon[h].get("discords", None)
+            if _eps_disc is None:
+                _eps_disc = 1.0
+            else:
+                _eps_disc = float(np.asarray(_eps_disc).reshape(()).item())
             class_matchers["discords"][h] = MultiShapeletMatcher(
-                [{"mat": m, "eps": (epsilon[h]["discords"] or 1.0)} for m in multi_shapelets[h]["discords"]]
+                [{"mat": m, "eps": _eps_disc} for m in multi_shapelets[h]["discords"]]
             )
 
     def slice_LF_asof(df, ts, L, cols):
