@@ -171,15 +171,27 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
     masks = {h: {"train": mask_by_months(feats[h], train_months),
                  "test":  mask_by_months(feats[h], test_months)} for h in feats}
 
-    # ----- Triple-barrier on micro (labels only for inspection/caching) -----
+    # ----- Triple-barrier on micro (labels) -----
+    # Choose mining vs. eval labels based on phase
+    is_mine_phase = (cfg.get("_phase") == "mine")
+    lbl_cfg = None
+    if is_mine_phase and "labels_mining" in cfg:
+        lbl_cfg = cfg["labels_mining"]
+    else:
+        lbl_cfg = cfg["labels"]
+
     micro = feats["micro"].copy()
+    # Ensure ATR column has no gaps (avoid NaNs); you already bfill/ffill elsewhere, keep it:
     micro["atr"] = micro["atr"].bfill().ffill()
+
     labels = triple_barrier_labels(
-        micro[["open","high","low","close","volume","atr"]].rename(columns={"atr":"atr"}),
+        micro[["open","high","low","close","volume","atr"]],
         atr_col="atr",
-        up_mult=cfg["labels"]["barrier_up_atr"],
-        dn_mult=cfg["labels"]["barrier_dn_atr"],
-        timeout_bars=cfg["labels"]["timeout_bars_micro"]
+        up_mult=float(lbl_cfg["barrier_up_atr"]),
+        dn_mult=float(lbl_cfg["barrier_dn_atr"]),
+        timeout_bars=int(lbl_cfg["timeout_bars_micro"]),
+        use_high_low=True,
+        include_equals=True,
     )
     micro["tb_label"] = labels.values
     save_parquet(micro, Path(cfg["paths"]["outputs_dir"]) / "features" / f"{symbol}_micro.parquet")

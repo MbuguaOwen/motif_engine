@@ -16,6 +16,11 @@ labels:
   # give moves time to happen (12h–24h is reasonable for 1m BTC)
   timeout_bars_micro: 720   # try 720 first; if still sparse, 1440
 
+labels_mining:
+  barrier_up_atr: 30       # easier for mining only (keeps 3:1 ratio)
+  barrier_dn_atr: 10
+  timeout_bars_micro: 1440 # 24h horizon to allow hits
+
 bars:
   source: "inputs_1m"
   atr_window: 50
