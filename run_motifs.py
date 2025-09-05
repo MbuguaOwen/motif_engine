@@ -2,6 +2,48 @@ import argparse, json
 from pathlib import Path
 import numpy as np, pandas as pd, yaml
 
+# --- epsilon helpers ---
+
+def _as_float(x, default=1.0):
+    """
+    Robustly convert x to a Python float.
+    - None or non-finite -> default
+    - array-like with >1 values -> median of finite values
+    - numpy scalar or 0-d array -> scalar item
+    """
+    try:
+        arr = np.asarray(x)
+        if arr.size == 0:
+            return float(default)
+        if arr.size > 1:
+            arr = arr[np.isfinite(arr)]
+            return float(np.median(arr)) if arr.size else float(default)
+        # 0-d array or scalar
+        val = arr.reshape(()).item()
+        return float(val) if np.isfinite(val) else float(default)
+    except Exception:
+        return float(default)
+
+
+def _coerce_eps_tree(epsilon):
+    """
+    In-place: ensure every epsilon in the nested structure is a Python float.
+    Structure:
+      epsilon[h]["long"]["good"|"bad"]
+      epsilon[h]["short"]["good"|"bad"]
+      epsilon[h]["discords"]
+    """
+    for h in list(epsilon.keys()):
+        for side in ("long", "short"):
+            if side in epsilon[h]:
+                for kind in ("good", "bad"):
+                    if kind in epsilon[h][side]:
+                        epsilon[h][side][kind] = _as_float(
+                            epsilon[h][side][kind], 1.0
+                        )
+        # discords
+        epsilon[h]["discords"] = _as_float(epsilon[h].get("discords", None), 1.0)
+
 from src.utils.io import (
     read_kline_1m_months,
     read_tick_months,
@@ -170,6 +212,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                         multi_shapelets[h][side][kind] = [np.asarray(W, dtype=float) for W in H["classes"][side][kind]["shapelets"]]
                 epsilon[h]["discords"] = float(H.get("discords", {}).get("epsilon", 1.0))
                 multi_shapelets[h]["discords"] = [np.asarray(W, dtype=float) for W in H.get("discords", {}).get("shapelets", [])]
+            _coerce_eps_tree(epsilon)
             # matchers built later in simulate section
         else:
             for h in ["macro", "meso", "micro"]:
@@ -307,6 +350,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                     epsilon[h][side][kind] = _cal_eps(h, side, kind)
             if len(multi_shapelets[h]["discords"]) > 0:
                 epsilon[h]["discords"] = 1.0  # keep loose or compute if desired
+        _coerce_eps_tree(epsilon)
 
     # --- UPDATE artifact persist to store features + banks (handle persist_artifacts + mine mode) ---
     if persist_artifacts and cfg.get("_phase") == "mine":
@@ -318,12 +362,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                      "features": feats_list,
                      "horizons": {}}
         for h in ["macro", "meso", "micro"]:
-            _eps_disc = epsilon[h].get("discords", None)
-            if _eps_disc is None:
-                _eps_disc = 1.0
-            else:
-                # robustly coerce any numpy scalar/array-like to a python float
-                _eps_disc = float(np.asarray(_eps_disc).reshape(()).item())
+            _disc_eps = _as_float(epsilon[h].get("discords", None), 1.0)
             artifacts["horizons"][h] = {
                 "L": int(cfg["motifs"]["horizons"][h]["L"]),
                 "classes": {
@@ -337,7 +376,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                                          "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["short"]["bad"]]}},
                 },
                 "discords": {
-                    "epsilon": _eps_disc,
+                    "epsilon": _disc_eps,
                     "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["discords"]]
                 }
             }
@@ -371,13 +410,9 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                 "good": MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["short"]["good"]} for m in multi_shapelets[h]["short"]["good"]]),
                 "bad":  MultiShapeletMatcher([{"mat": m, "eps": epsilon[h]["short"]["bad"]}  for m in multi_shapelets[h]["short"]["bad"]]),
             }
-            _eps_disc = epsilon[h].get("discords", None)
-            if _eps_disc is None:
-                _eps_disc = 1.0
-            else:
-                _eps_disc = float(np.asarray(_eps_disc).reshape(()).item())
+            _disc_eps = _as_float(epsilon[h].get("discords", None), 1.0)
             class_matchers["discords"][h] = MultiShapeletMatcher(
-                [{"mat": m, "eps": _eps_disc} for m in multi_shapelets[h]["discords"]]
+                [{"mat": m, "eps": _disc_eps} for m in multi_shapelets[h]["discords"]]
             )
 
     def slice_LF_asof(df, ts, L, cols):
