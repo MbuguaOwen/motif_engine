@@ -77,7 +77,7 @@ def read_kline_1m_months(
         else:
             # Skips silently if a month is missing; you can raise if preferred
             pass
-    if not dfs:
+    if len(dfs) == 0:
         raise FileNotFoundError(
             f"No 1m kline files found for {symbol} months={months} under {inputs_dir}"
         )
