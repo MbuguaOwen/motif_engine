@@ -13,7 +13,8 @@ engine:
 labels:
   barrier_up_atr: 60     # mirror tp_mult
   barrier_dn_atr: 20      # mirror sl_mult
-  timeout_bars_micro: 180
+  # give moves time to happen (12h–24h is reasonable for 1m BTC)
+  timeout_bars_micro: 720   # try 720 first; if still sparse, 1440
 
 bars:
   source: "inputs_1m"
@@ -55,24 +56,24 @@ motifs:
   horizons:
     macro:
       L: 40
-      top_k: 5
-      keep: 2
-      candidate_stride: 5
+      top_k: 120
+      keep: 40
+      candidate_stride: 1
       hit_eps_pct_range: [5, 25]
       weight: 0.5
       freshness_bars: 12
     meso:
       L: 60
-      top_k: 5
-      keep: 2
-      candidate_stride: 3
+      top_k: 240
+      keep: 80
+      candidate_stride: 1
       hit_eps_pct_range: [5, 25]
       weight: 0.3
       freshness_bars: 15
     micro:
       L: 30
-      top_k: 5
-      keep: 2
+      top_k: 1200
+      keep: 300
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
       weight: 0.2
@@ -82,12 +83,13 @@ gating:
   require_macro: true
   require_meso: true
   require_micro: true
-  score_min: 0.70
+  # start lenient so we actually place trades; tighten later
+  score_min: 0.60
   pick_side: "argmax"      # "argmax" | "macro_sign"
-  bad_max: 0.60            # max allowed composite from BAD bank
-  alpha: 0.25              # weight on BAD in (S_good - alpha* S_bad)
-  margin_min: 0.05         # minimum (S_good - alpha * S_bad)
-  discord_block_min: 0.90  # if any horizon discord score >= this, block
+  bad_max: 0.70            # max allowed composite from BAD bank
+  alpha: 0.15              # weight on BAD in (S_good - alpha* S_bad)
+  margin_min: 0.00         # minimum (S_good - alpha * S_bad)
+  discord_block_min: 0.99  # if any horizon discord score >= this, block
   cooldown_bars: 20
 
 risk:
