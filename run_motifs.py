@@ -174,8 +174,11 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                                                for s in shapelets[h][:cfg["motifs"]["horizons"][h]["keep"]]])
             feats_list = _pick_features(feats["micro"], cfg)
     else:
-        motif_starts = {}
-        for h in wrap_iter(["macro", "meso", "micro"], total=3, desc=f"Mine[{symbol}]", yaml_cfg=cfg, cli_disable=cli_disable):
+        # Fresh mining from TRAIN months (keep 1-D candidate enumeration for speed)
+        motif_starts = {}     # keep motif start indices per horizon
+        discord_starts = {}   # NEW: keep discord start indices per horizon
+
+        for h in wrap_iter(["macro","meso","micro"], total=3, desc=f"Mine[{symbol}]", yaml_cfg=cfg, cli_disable=cli_disable):
             L = cfg["motifs"]["horizons"][h]["L"]
             stride = cfg["motifs"]["horizons"][h]["candidate_stride"]
             top_k = cfg["motifs"]["horizons"][h]["top_k"]
@@ -183,53 +186,74 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             cand = sample_candidates(series, L, stride)
             if len(cand) == 0:
                 raise RuntimeError(f"No candidates for {h}")
-            motif_idx, discord_idx, _ = neighbor_density_pick(series, L, cand,
-                                                              k=10, top_k=top_k,
-                                                              yaml_cfg=cfg, cli_disable=cli_disable,
-                                                              desc=f"Mine {h}@L={L}")
-            motif_starts[h] = motif_idx
-            shapelets[h] = [series[s:s+L].copy() for s in motif_idx]  # 1-D for now
+
+            motif_idx, discord_idx, _ = neighbor_density_pick(
+                series, L, cand, k=10, top_k=top_k,
+                yaml_cfg=cfg, cli_disable=cli_disable, desc=f"Mine {h}@L={L}"
+            )
+
+            motif_starts[h]  = motif_idx
+            discord_starts[h] = discord_idx     # NEW
+            shapelets[h] = [series[s:s+L].copy() for s in motif_idx]
+
+        # --- Build multivariate class-aware banks per horizon (unchanged scaffold) ---
         from collections import defaultdict
         multi_shapelets = {h: {"long": {"good": [], "bad": []},
-                               "short": {"good": [], "bad": []},
-                               "discords": []} for h in ["macro", "meso", "micro"]}
+                               "short":{"good": [], "bad": []},
+                               "discords": []} for h in ["macro","meso","micro"]}
         epsilon = {h: {"long": {"good": None, "bad": None},
-                       "short": {"good": None, "bad": None},
-                       "discords": None} for h in ["macro", "meso", "micro"]}
+                       "short":{"good": None, "bad": None},
+                       "discords": None} for h in ["macro","meso","micro"]}
+
+        # Map micro timestamp -> tb_label (+1 up, -1 down, 0 timeout)
         micro_map = dict(zip(micro_full["timestamp"].astype(str), micro["tb_label"].astype(int)))
+
+        # Feature list (persist later)
         feats_list = _pick_features(feats["micro"], cfg)
-        for h in ["macro", "meso", "micro"]:
+
+        for h in ["macro","meso","micro"]:
             L = cfg["motifs"]["horizons"][h]["L"]
             feats_h = feats[h].reset_index(drop=True)
             idx_train = np.where(masks[h]["train"])[0]
+
+            # ---- Motifs → multivariate windows with guards ----
             for s in motif_starts[h]:
+                if s + L - 1 >= len(idx_train):   # NEW guard
+                    continue
                 end_row = idx_train[s + L - 1]
                 ts = str(feats_h.loc[end_row, "timestamp"])
                 tb = int(micro_map.get(ts, 0))
+                # macro sign from this horizon's close window
                 close_win = feats_h["close"].iloc[end_row-L+1:end_row+1].to_numpy(float)
                 msign = _macro_sign_from_window(close_win)
+
                 if tb == 0:
-                    pass
+                    continue
                 elif tb == 1 and msign > 0:
-                    cls = ("long", "good")
+                    side, kind = "long", "good"
                 elif tb == -1 and msign < 0:
-                    cls = ("short", "good")
+                    side, kind = "short", "good"
                 elif tb == -1 and msign > 0:
-                    cls = ("long", "bad")
+                    side, kind = "long", "bad"
                 elif tb == 1 and msign < 0:
-                    cls = ("short", "bad")
+                    side, kind = "short", "bad"
                 else:
                     continue
+
                 W = _window_LF(feats_h, end_row, L, feats_list)
-                if W is None or not np.isfinite(W).all():
+                if W is not None and np.isfinite(W).all():
+                    multi_shapelets[h][side][kind].append(W)
+
+            # ---- Discords → multivariate windows per horizon with guards ----
+            for s in (discord_starts.get(h, []) or []):
+                if s + L - 1 >= len(idx_train):   # NEW guard
                     continue
-                multi_shapelets[h][cls[0]][cls[1]].append(W)
-            if 'discord_idx' in locals():
-                for s in discord_idx:
-                    end_row = idx_train[s + L - 1]
-                    Wd = _window_LF(feats_h, end_row, L, feats_list)
-                    if Wd is not None and np.isfinite(Wd).all():
-                        multi_shapelets[h]["discords"].append(Wd)
+                end_row = idx_train[s + L - 1]
+                Wd = _window_LF(feats_h, end_row, L, feats_list)
+                if Wd is not None and np.isfinite(Wd).all():
+                    multi_shapelets[h]["discords"].append(Wd)
+
+        # --- Calibrate ε per (horizon, bank) (unchanged) ---
         from src.motifs.mass import zdist_multi
         def _cal_eps(h, side, kind):
             mats = multi_shapelets[h][side][kind]
@@ -262,14 +286,13 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                         continue
                     dpool.append(zdist_multi(mat, W))
             return float(np.percentile(np.asarray(dpool), 15)) if dpool else 1.0
-        for h in ["macro", "meso", "micro"]:
-            for side in ["long", "short"]:
-                for kind in ["good", "bad"]:
+
+        for h in ["macro","meso","micro"]:
+            for side in ["long","short"]:
+                for kind in ["good","bad"]:
                     epsilon[h][side][kind] = _cal_eps(h, side, kind)
             if multi_shapelets[h]["discords"]:
-                epsilon[h]["discords"] = np.percentile(
-                    [zdist_multi(m, m) for m in multi_shapelets[h]["discords"]], 15
-                ) if multi_shapelets[h]["discords"] else 1.0
+                epsilon[h]["discords"] = 1.0  # keep loose or compute if desired
 
     # --- UPDATE artifact persist to store features + banks (handle persist_artifacts + mine mode) ---
     if persist_artifacts and cfg.get("_phase") == "mine":
