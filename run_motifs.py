@@ -294,9 +294,11 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                 if W is not None and np.isfinite(W).all():
                     multi_shapelets[h][side][kind].append(W)
 
-            # ---- Discords → multivariate windows per horizon with guards ----
-            for s in (discord_starts.get(h, []) or []):
-                if s + L - 1 >= len(idx_train):   # NEW guard
+            # ---- Discords → multivariate windows per horizon (no boolean array) ----
+            ds = discord_starts.get(h, None)
+            iter_ds = [] if ds is None else (ds.tolist() if hasattr(ds, "tolist") else list(ds))
+            for s in iter_ds:
+                if s + L - 1 >= len(idx_train):   # guard
                     continue
                 end_row = idx_train[s + L - 1]
                 Wd = _window_LF(feats_h, end_row, L, feats_list)
