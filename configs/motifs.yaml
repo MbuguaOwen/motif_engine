@@ -76,7 +76,7 @@ motifs:
       keep: 80
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
-      weight: 0.30
+      weight: 0.40        # give meso more say
       freshness_bars: 15
     micro:
       L: 30
@@ -84,21 +84,21 @@ motifs:
       keep: 300
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
-      weight: 0.50
+      weight: 0.40        # take a little from micro
       freshness_bars: 5
 
 gating:
   require_macro: false     # was true
-  require_meso:  false     # was true
-  require_micro: true
+  require_meso:  true      # require alignment on meso
+  require_micro: true      # ...and micro
   # match scores from MultiShapeletMatcher are typically ~0.05–0.30
-  score_min: 0.12          # was 0.60; start lenient, tighten later
+  score_min: 0.28          # tighter quality bar (was ~0.12–0.20)
   pick_side: "argmax"
-  bad_max: 0.95
-  alpha: 0.10
-  margin_min: -0.02
+  bad_max: 0.80            # earlier bad veto (was 0.95)
+  alpha: 0.30              # penalize BAD in margin more
+  margin_min: 0.02         # require positive (S_good - alpha*S_bad)
   discord_block_min: 0.995
-  cooldown_bars: 30
+  cooldown_bars: 120       # cut over-trading
 
 risk:
   sl_mult: 20.0
