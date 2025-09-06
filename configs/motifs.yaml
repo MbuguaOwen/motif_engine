@@ -88,17 +88,17 @@ motifs:
       freshness_bars: 5
 
 gating:
-  require_macro: false       # macro banks were sparse; don't hard-require
-  require_meso: true
+  require_macro: false     # was true
+  require_meso:  false     # was true
   require_micro: true
-  # start lenient so we actually place trades; tighten later
-  score_min: 0.55            # was 0.60
-  pick_side: "argmax"      # "argmax" | "macro_sign"
-  bad_max: 0.85              # was 0.70–0.75
-  alpha: 0.20                # more penalty on BAD
-  margin_min: -0.02          # allow near-ties initially
-  discord_block_min: 0.9995  # slightly less sensitive
-  cooldown_bars: 20
+  # match scores from MultiShapeletMatcher are typically ~0.05–0.30
+  score_min: 0.12          # was 0.60; start lenient, tighten later
+  pick_side: "argmax"
+  bad_max: 0.95
+  alpha: 0.10
+  margin_min: -0.02
+  discord_block_min: 0.995
+  cooldown_bars: 30
 
 risk:
   sl_mult: 20.0
@@ -115,3 +115,4 @@ ui:
   progress: true
   progress_ascii: true
   progress_mininterval: 0.2
+  simulate_debug_first_n: 0   # 0 = don’t print per-minute decisions
