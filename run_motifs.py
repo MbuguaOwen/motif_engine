@@ -46,6 +46,60 @@ def _coerce_eps_tree(epsilon):
         # discords
         epsilon[h]["discords"] = _as_float(epsilon[h].get("discords", None), 1.0)
 
+
+def _coerce_numeric(df, cols):
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+
+def _prep_ohlc_atr_for_labels(df, atr_window):
+    """
+    Ensure OHLC/ATR fields are clean prior to labeling.
+    - Coerce to numeric
+    - Fix high<low inversions
+    - Compute ATR if missing or fully NaN
+    - Back/forward fill small gaps
+    - Final assert: finite in (high, low, close, atr)
+    """
+    df = df.copy()
+
+    need = ["open", "high", "low", "close", "volume"]
+    for c in need:
+        if c not in df.columns:
+            raise ValueError(f"[DATA] missing column '{c}' for labeling")
+
+    _coerce_numeric(df, need + (["atr"] if "atr" in df.columns else []))
+
+    inv = df["high"] < df["low"]
+    if inv.any():
+        hi = df.loc[inv, "high"].values
+        df.loc[inv, "high"] = df.loc[inv, "low"].values
+        df.loc[inv, "low"] = hi
+
+    need_atr = ("atr" not in df.columns) or (~np.isfinite(df["atr"].to_numpy())).all()
+    if need_atr:
+        prev_close = df["close"].shift(1)
+        tr = (df["high"] - df["low"]).abs()
+        tr = np.maximum(tr, (df["high"] - prev_close).abs())
+        tr = np.maximum(tr, (df["low"] - prev_close).abs())
+        df["atr"] = tr.rolling(int(atr_window), min_periods=1).mean()
+
+    for c in ["open", "high", "low", "close", "volume", "atr"]:
+        df[c] = df[c].bfill().ffill()
+
+    req = df[["high", "low", "close", "atr"]]
+    bad_mask = ~np.isfinite(req.to_numpy(float)).all(axis=1)
+    dropped = int(bad_mask.sum())
+    if dropped:
+        df = df.loc[~bad_mask].reset_index(drop=True)
+        print(f"[DATA] dropped {dropped} non-finite rows before labeling")
+
+    n_flip = int((df["high"] < df["low"]).sum())
+    if n_flip:
+        print(f"[DATA] WARNING: {n_flip} high<low rows after cleaning")
+
+    return df
+
 from src.utils.io import (
     read_kline_1m_months,
     read_tick_months,
@@ -174,17 +228,13 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                  "test":  mask_by_months(feats[h], test_months)} for h in feats}
 
     # ----- Triple-barrier on micro (labels) -----
-    # Choose mining vs. eval labels based on phase
-    is_mine_phase = (cfg.get("_phase") == "mine")
-    lbl_cfg = None
-    if is_mine_phase and "labels_mining" in cfg:
-        lbl_cfg = cfg["labels_mining"]
-    else:
-        lbl_cfg = cfg["labels"]
-
+    # --- Build a clean micro frame for labeling (always) ---
     micro = feats["micro"].copy()
-    # Ensure ATR column has no gaps (avoid NaNs); you already bfill/ffill elsewhere, keep it:
-    micro["atr"] = micro["atr"].bfill().ffill()
+    micro = _prep_ohlc_atr_for_labels(micro, atr_window=int(cfg["bars"]["atr_window"]))
+
+    # Choose eval vs. mining labels
+    is_mine_phase = (cfg.get("_phase") == "mine")
+    lbl_cfg = cfg["labels_mining"] if (is_mine_phase and "labels_mining" in cfg) else cfg["labels"]
 
     labels = triple_barrier_labels(
         micro[["open","high","low","close","volume","atr"]],
@@ -196,16 +246,24 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         include_equals=True,
     )
     micro["tb_label"] = labels.values
-    # --- Label sanity (all rows) ---
-    try:
-        _vc_all = pd.Series(micro["tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
-        print(f"[LABELS] phase={cfg.get('_phase')} used up={float(lbl_cfg['barrier_up_atr'])} "
-              f"dn={float(lbl_cfg['barrier_dn_atr'])} timeout={int(lbl_cfg['timeout_bars_micro'])} "
-              f"use_high_low=True | counts(all)={{-1:{int(_vc_all.loc[-1])},0:{int(_vc_all.loc[0])},1:{int(_vc_all.loc[1])}}}")
-    except Exception as _e:
-        print(f"[LABELS] count error (all): {_e}")
+    feats["micro"] = micro  # keep in feats map if later logic needs it
+
+    # --- Label audits ---
+    vc_all = pd.Series(micro["tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+    print(f"[LABELS] phase={('mine' if is_mine_phase else cfg.get('_phase'))} "
+          f"used up={float(lbl_cfg['barrier_up_atr'])} dn={float(lbl_cfg['barrier_dn_atr'])} "
+          f"timeout={int(lbl_cfg['timeout_bars_micro'])} use_high_low=True | "
+          f"counts(all)={{-1:{int(vc_all.loc[-1])},0:{int(vc_all.loc[0])},1:{int(vc_all.loc[1])}}}")
+
+    if is_mine_phase:
+        mtrain = np.asarray(masks['micro']['train']).astype(bool)
+        vc_tr = pd.Series(micro.loc[mtrain, "tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+        months_train = pd.to_datetime(micro.loc[mtrain, "timestamp"], utc=True, errors="coerce").dt.strftime("%Y-%m")
+        print(f"[LABELS] TRAIN label counts {{-1:{int(vc_tr.loc[-1])},0:{int(vc_tr.loc[0])},1:{int(vc_tr.loc[1])}}} "
+              f"| rows_by_month={months_train.value_counts().sort_index().to_dict()}")
+        if int(vc_tr.loc[-1]) == 0 and int(vc_tr.loc[1]) == 0:
+            print("[WARN] TRAIN labels have no +1/-1 (all timeouts). Raise timeout_bars_mining or ease barriers (e.g., 24/8).")
     save_parquet(micro, Path(cfg["paths"]["outputs_dir"]) / "features" / f"{symbol}_micro.parquet")
-    feats["micro"] = micro
     micro_full = micro
 
     # ----- Mining / ε -----
