@@ -68,7 +68,7 @@ motifs:
       keep: 40
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
-      weight: 0.5
+      weight: 0.20
       freshness_bars: 12
     meso:
       L: 60
@@ -76,7 +76,7 @@ motifs:
       keep: 80
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
-      weight: 0.3
+      weight: 0.30
       freshness_bars: 15
     micro:
       L: 30
@@ -84,20 +84,20 @@ motifs:
       keep: 300
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
-      weight: 0.2
+      weight: 0.50
       freshness_bars: 5
 
 gating:
-  require_macro: true
+  require_macro: false       # macro banks were sparse; don't hard-require
   require_meso: true
   require_micro: true
   # start lenient so we actually place trades; tighten later
-  score_min: 0.60
+  score_min: 0.55            # was 0.60
   pick_side: "argmax"      # "argmax" | "macro_sign"
-  bad_max: 0.70            # max allowed composite from BAD bank
-  alpha: 0.15              # weight on BAD in (S_good - alpha* S_bad)
-  margin_min: 0.00         # minimum (S_good - alpha * S_bad)
-  discord_block_min: 0.99  # if any horizon discord score >= this, block
+  bad_max: 0.85              # was 0.70–0.75
+  alpha: 0.20                # more penalty on BAD
+  margin_min: -0.02          # allow near-ties initially
+  discord_block_min: 0.9995  # slightly less sensitive
   cooldown_bars: 20
 
 risk:

@@ -116,6 +116,7 @@ from src.labeling.triple_barrier import triple_barrier_labels
 from src.motifs.miner import sample_candidates, neighbor_density_pick
 from src.motifs.matcher import ShapeletMatcher, MultiShapeletMatcher  # NEW
 from src.engine.gating import composite_score
+from src.gating import passes_gate, GateDecision
 from src.engine.risk import RiskManager
 from src.ui.progress import wrap_iter, progress_redirect_logs, bar
 
@@ -538,7 +539,9 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
     micro_test = micro_full[masks["micro"]["test"]].reset_index(drop=True)
     Ls = {h: cfg["motifs"]["horizons"][h]["L"] for h in ["macro","meso","micro"]}
     weights = {h: cfg["motifs"]["horizons"][h]["weight"] for h in ["macro","meso","micro"]}
-    score_min = cfg["gating"]["score_min"]; cooldown_bars = cfg["gating"]["cooldown_bars"]; cooldown = 0
+    pick_side = cfg.get("gating", {}).get("pick_side", "argmax")
+    cooldown_bars = cfg["gating"]["cooldown_bars"]
+    cooldown = 0
 
     feats_list = _pick_features(feats["micro"], cfg)  # ensure defined
     class_matchers = {"long": {}, "short": {}, "discords": {}}
@@ -562,17 +565,15 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         if len(d) < L: return None
         return d.iloc[-L:][cols].to_numpy(dtype=float)
 
-    bad_max = float(cfg.get("gating", {}).get("bad_max", 0.60))
-    alpha = float(cfg.get("gating", {}).get("alpha", 0.25))
-    margin_min = float(cfg.get("gating", {}).get("margin_min", 0.05))
-    pick_side = cfg.get("gating", {}).get("pick_side", "argmax")
-    discord_block_min = cfg.get("gating", {}).get("discord_block_min", 0.9)
+    debug_cap = 100  # print first 100 decisions for quick visibility
+    dbg_printed = 0
+    rej_counts = {"score":0, "bad":0, "margin":0, "macro_req":0, "meso_req":0, "micro_req":0, "discord":0, "ok":0}
 
-    def _assert_scalar(*vals):
-        for v in vals:
-            if isinstance(v, (np.ndarray, pd.Series)):
-                assert v.ndim == 0 or v.size == 1, f"Expected scalar, got shape={getattr(v,'shape',None)}"
-        return tuple(float(np.asarray(v).reshape(-1)[0]) if isinstance(v, (np.ndarray, pd.Series)) else v for v in vals)
+    def _dbg(msg):
+        nonlocal dbg_printed
+        if dbg_printed < debug_cap:
+            print("[SIMDBG]", msg)
+            dbg_printed += 1
 
     results = []
     sim_start = max(Ls.values())
@@ -596,42 +597,39 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
 
         has_long = ('class_matchers' in locals()) and (len(class_matchers.get("long", {})) > 0)
         if has_long:
-            scores_long_good = {h: class_matchers["long"][h]["good"].match_score(wins[h])[0]  for h in ["macro", "meso", "micro"]}
-            scores_short_good = {h: class_matchers["short"][h]["good"].match_score(wins[h])[0] for h in ["macro", "meso", "micro"]}
-            scores_long_bad = {h: class_matchers["long"][h]["bad"].match_score(wins[h])[0]   for h in ["macro", "meso", "micro"]}
-            scores_short_bad = {h: class_matchers["short"][h]["bad"].match_score(wins[h])[0]  for h in ["macro", "meso", "micro"]}
+            scores_long_good = {h: float(class_matchers["long"][h]["good"].match_score(wins[h])[0]) for h in ["macro", "meso", "micro"]}
+            scores_short_good = {h: float(class_matchers["short"][h]["good"].match_score(wins[h])[0]) for h in ["macro", "meso", "micro"]}
+            scores_long_bad = {h: float(class_matchers["long"][h]["bad"].match_score(wins[h])[0])   for h in ["macro", "meso", "micro"]}
+            scores_short_bad = {h: float(class_matchers["short"][h]["bad"].match_score(wins[h])[0])  for h in ["macro", "meso", "micro"]}
 
-            Sg_long = composite_score(scores_long_good["macro"], scores_long_good["meso"], scores_long_good["micro"],
-                                      wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
-            Sg_short = composite_score(scores_short_good["macro"], scores_short_good["meso"], scores_short_good["micro"],
-                                       wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
-            Sb_long = composite_score(scores_long_bad["macro"], scores_long_bad["meso"], scores_long_bad["micro"],
-                                      wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
-            Sb_short = composite_score(scores_short_bad["macro"], scores_short_bad["meso"], scores_short_bad["micro"],
-                                       wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
+            Sg_long_comp = composite_score(scores_long_good["macro"], scores_long_good["meso"], scores_long_good["micro"],
+                                           wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
+            Sg_short_comp = composite_score(scores_short_good["macro"], scores_short_good["meso"], scores_short_good["micro"],
+                                            wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
 
             if pick_side == "argmax":
-                if Sg_long >= Sg_short:
-                    side, Sg, Sb = "long", Sg_long, Sb_long
+                if Sg_long_comp >= Sg_short_comp:
+                    side, Sg, Sb = "long", scores_long_good, scores_long_bad
                 else:
-                    side, Sg, Sb = "short", Sg_short, Sb_short
+                    side, Sg, Sb = "short", scores_short_good, scores_short_bad
             else:
                 mac_close = macro_full[macro_full["timestamp"] <= ts]["close"].tail(Ls["macro"]).to_numpy(float)
                 side = "long" if mac_close[-1] - mac_close[0] >= 0 else "short"
-                Sg = Sg_long if side == "long" else Sg_short
-                Sb = Sb_long if side == "long" else Sb_short
-            Sg, Sb = _assert_scalar(Sg, Sb)
+                Sg = scores_long_good if side == "long" else scores_short_good
+                Sb = scores_long_bad if side == "long" else scores_short_bad
 
-            has_discords = (len(class_matchers.get("discords", {})) > 0) and any(
-                hasattr(class_matchers["discords"].get(h, None), "match_score") for h in ["macro", "meso", "micro"]
-            )
-            block_by_discord = False
-            if has_discords:
-                Sd = [class_matchers["discords"][h].match_score(wins[h])[0] for h in ["macro", "meso", "micro"]]
-                block_by_discord = (len(Sd) > 0) and (max(Sd) >= discord_block_min)
+            discord_scores = {}
+            if len(class_matchers.get("discords", {})) > 0:
+                discord_scores = {h: float(class_matchers["discords"][h].match_score(wins[h])[0]) for h in ["macro", "meso", "micro"]}
 
-            if (Sg < score_min) or (Sb >= bad_max) or ((Sg - alpha * Sb) < margin_min) or block_by_discord:
+            decision = passes_gate(Sg, Sb, discord_scores, cfg, debug=True)
+            rej_counts["ok" if decision.ok else decision.reason] += 1
+
+            if not decision.ok:
+                _dbg(f"t={ts} side={side} reason={decision.reason} details={decision.details}")
                 continue
+
+            _dbg(f"t={ts} side={side} reason=OK details={decision.details}")
         else:
             def slice_asof_df(df, L):
                 d = df[df["timestamp"] <= ts]
@@ -645,17 +643,23 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             for h in ["macro", "meso", "micro"]:
                 svec = wins_df[h]["ret_z"].values
                 score, hit = matchers[h].match_score(svec)
-                scores[h] = score; hits[h] = hit
+                scores[h] = float(score); hits[h] = hit
             if not (hits["macro"] and hits["meso"] and hits["micro"]):
                 continue
-            Sg = composite_score(scores["macro"], scores["meso"], scores["micro"],
-                                 wM=weights["macro"], wm=weights["meso"], wmu=weights["micro"])
-            if Sg < score_min:
-                continue
-            Sb = 0.0
             mac_close_df = wins_df["macro"]["close"].values
             side = "long" if mac_close_df[-1] - mac_close_df[0] > 0 else "short"
-            Sg, Sb = _assert_scalar(Sg, Sb)
+            Sg = scores
+            Sb = {"macro": 0.0, "meso": 0.0, "micro": 0.0}
+            discord_scores = {}
+
+            decision = passes_gate(Sg, Sb, discord_scores, cfg, debug=True)
+            rej_counts["ok" if decision.ok else decision.reason] += 1
+
+            if not decision.ok:
+                _dbg(f"t={ts} side={side} reason={decision.reason} details={decision.details}")
+                continue
+
+            _dbg(f"t={ts} side={side} reason=OK details={decision.details}")
 
         entry = float(micro_test.loc[i, "close"])
         atr_entry = float(micro_test.loc[i, "atr"])
@@ -671,6 +675,8 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         results.append({"i": int(i), "timestamp": str(ts), "side": side,
                         "entry": entry, "R": float(R), "hold_bars": int(hold)})
         cooldown = cooldown_bars
+
+    print("[SIMDBG] decision summary:", rej_counts)
 
     R_list = [x["R"] for x in results]
     summary = {"symbol": symbol, "train_months": train_months, "test_months": test_months,
