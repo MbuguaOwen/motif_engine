@@ -1,5 +1,6 @@
 import argparse, json
 from pathlib import Path
+import time
 import numpy as np
 import pandas as pd
 import yaml
@@ -50,60 +51,59 @@ def _coerce_eps_tree(epsilon):
 def _coerce_numeric(df, cols):
     for c in cols:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
 
 
-def _prep_ohlc_atr_for_labels(df, atr_window):
+def _prep_ohlc_atr_for_labels(df, atr_window: int):
     """
-    Ensure OHLC/ATR fields are clean prior to labeling.
-    - Coerce to numeric
-    - Fix high<low inversions
-    - Compute ATR if missing or fully NaN
-    - Back/forward fill small gaps
-    - Final assert: finite in (high, low, close, atr)
+    Make OHLC/ATR finite and consistent:
+    - numeric coercion
+    - fix high<low
+    - compute ATR if missing/all-NaN
+    - bfill/ffill
+    - drop bad rows (but never to zero length)
     """
     df = df.copy()
-
-    need = ["open", "high", "low", "close", "volume"]
+    need = ["open","high","low","close","volume"]
     for c in need:
         if c not in df.columns:
             raise ValueError(f"[DATA] missing column '{c}' for labeling")
-
     _coerce_numeric(df, need + (["atr"] if "atr" in df.columns else []))
 
-    # fix inverted high/low
     inv = df["high"] < df["low"]
     if inv.any():
         hi = df.loc[inv, "high"].values
         df.loc[inv, "high"] = df.loc[inv, "low"].values
         df.loc[inv, "low"] = hi
 
-    # ensure ATR exists and is finite-ish
     need_atr = ("atr" not in df.columns) or (~np.isfinite(df["atr"].to_numpy())).all()
     if need_atr:
         prev_close = df["close"].shift(1)
         tr = (df["high"] - df["low"]).abs()
         tr = np.maximum(tr, (df["high"] - prev_close).abs())
         tr = np.maximum(tr, (df["low"] - prev_close).abs())
-        df["atr"] = tr.rolling(int(atr_window), min_periods=1).mean()
+        df["atr"] = tr.rolling(int(max(1, atr_window)), min_periods=1).mean()
 
-    # fill small gaps
-    for c in ["open", "high", "low", "close", "volume", "atr"]:
+    for c in ["open","high","low","close","volume","atr"]:
         df[c] = df[c].bfill().ffill()
 
-    req = df[["high", "low", "close", "atr"]]
+    req = df[["high","low","close","atr"]]
     bad_mask = ~np.isfinite(req.to_numpy(float)).all(axis=1)
     dropped = int(bad_mask.sum())
     if dropped > 0:
         if dropped == len(df):
-            print(f"[DATA] WARNING: all rows non-finite after cleaning; keeping rows (no drop).")
-            return df.reset_index(drop=True)
-        print(f"[DATA] dropped {dropped} non-finite rows before labeling")
-        df = df.loc[~bad_mask].reset_index(drop=True)
-
+            print("[DATA] WARNING: all rows non-finite after cleaning; keeping rows (no drop).")
+        else:
+            df = df.loc[~bad_mask].reset_index(drop=True)
+            print(f"[DATA] dropped {dropped} non-finite rows before labeling")
     if (df["high"] < df["low"]).any():
-        print(f"[DATA] WARNING: high<low rows remain after cleaning")
-
+        print("[DATA] WARNING: high<low rows remain after cleaning")
     return df
+
+
+def _mask_by_months(df, months):
+    m = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.strftime("%Y-%m")
+    return m.isin(pd.Index(months)).to_numpy(bool)
 
 from src.utils.io import (
     read_kline_1m_months,
@@ -220,14 +220,17 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             feats[h] = build_feats(bars_1m, tf, atr_win)
             save_parquet(feats[h], fpath)
 
-    # ----- Clean and label micro frame -----
+    # ----- Clean micro BEFORE labeling and BEFORE masks -----
     micro = feats["micro"].copy()
     micro = _prep_ohlc_atr_for_labels(micro, atr_window=int(cfg["bars"]["atr_window"]))
 
+    # Decide label config for this phase (mine uses labels_mining)
     is_mine_phase = (cfg.get("_phase") == "mine")
     lbl_cfg = cfg["labels_mining"] if (is_mine_phase and "labels_mining" in cfg) else cfg["labels"]
+
+    # Compute labels (high/low aware)
     labels = triple_barrier_labels(
-        micro[["open", "high", "low", "close", "volume", "atr"]],
+        micro[["open","high","low","close","volume","atr"]],
         atr_col="atr",
         up_mult=float(lbl_cfg["barrier_up_atr"]),
         dn_mult=float(lbl_cfg["barrier_dn_atr"]),
@@ -236,31 +239,52 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         include_equals=True,
     )
     micro["tb_label"] = labels.values
-    feats["micro"] = micro  # <- replace micro in feats map
-    save_parquet(micro, Path(cfg["paths"]["outputs_dir"]) / "features" / f"{symbol}_micro.parquet")
+    feats["micro"] = micro  # keep in feats map
 
-    # ----- Month masks (computed after micro cleaning) -----
-    def mask_by_months(df, months):
-        m = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m")
-        return m.isin(pd.Index(months)).to_numpy(bool)
+    # Audits (all rows)
+    vc_all = pd.Series(micro["tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+    print(f"[LABELS] phase={'mine' if is_mine_phase else cfg.get('_phase')} "
+          f"used up={float(lbl_cfg['barrier_up_atr'])} dn={float(lbl_cfg['barrier_dn_atr'])} "
+          f"timeout={int(lbl_cfg['timeout_bars_micro'])} use_high_low=True | "
+          f"counts(all)={{-1:{int(vc_all.loc[-1])},0:{int(vc_all.loc[0])},1:{int(vc_all.loc[1])}}}")
 
+    # NOW build month masks using the cleaned frames (sizes will match)
     masks = {
         h: {
-            "train": mask_by_months(feats[h], train_months),
-            "test": mask_by_months(feats[h], test_months),
+            "train": _mask_by_months(feats[h], train_months),
+            "test":  _mask_by_months(feats[h], test_months),
         }
         for h in feats
     }
 
-    # (optional) print train label counts for audit in mining phase
+    # If mining and TRAIN has no ±1, auto-relax labels for this fold and relabel
     if is_mine_phase:
         mtrain = masks["micro"]["train"]
-        vc_tr = pd.Series(micro.loc[mtrain, "tb_label"]).value_counts().reindex([-1, 0, 1], fill_value=0)
-        by_mon = pd.to_datetime(micro.loc[mtrain, "timestamp"]).dt.strftime("%Y-%m").value_counts().sort_index().to_dict()
-        print(f"[LABELS] TRAIN label counts {{-1:{int(vc_tr[-1])},0:{int(vc_tr[0])},1:{int(vc_tr[1])}}} | rows_by_month={by_mon}")
-        if vc_tr[1] == 0 and vc_tr[-1] == 0:
-            print("[WARN] TRAIN labels have no +1/-1. Consider easier mining labels (e.g., up/dn=24/8, timeout=1440).")
+        vc_tr = pd.Series(micro.loc[mtrain, "tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+        print(
+            f"[LABELS] TRAIN label counts {{-1:{int(vc_tr.loc[-1])},0:{int(vc_tr.loc[0])},1:{int(vc_tr.loc[1])}}} "
+            f"| rows_by_month={pd.to_datetime(micro.loc[mtrain,'timestamp'], utc=True, errors='coerce').dt.strftime('%Y-%m').value_counts().sort_index().to_dict()}"
+        )
+        if int(vc_tr.loc[-1]) == 0 and int(vc_tr.loc[1]) == 0:
+            fb = cfg.get("labels_mining_relax", {"barrier_up_atr":24, "barrier_dn_atr":8, "timeout_bars_micro":2880})
+            print(
+                f"[LABELS] RELAX: no ±1 in TRAIN → retry mining labels with up={fb['barrier_up_atr']}, dn={fb['barrier_dn_atr']}, timeout={fb['timeout_bars_micro']}"
+            )
+            labels = triple_barrier_labels(
+                micro[["open","high","low","close","volume","atr"]],
+                atr_col="atr",
+                up_mult=float(fb["barrier_up_atr"]),
+                dn_mult=float(fb["barrier_dn_atr"]),
+                timeout_bars=int(fb["timeout_bars_micro"]),
+                use_high_low=True,
+                include_equals=True,
+            )
+            micro["tb_label"] = labels.values
+            feats["micro"] = micro
+            vc_tr = pd.Series(micro.loc[mtrain, "tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+            print(f"[LABELS] TRAIN (relaxed) counts {{-1:{int(vc_tr.loc[-1])},0:{int(vc_tr.loc[0])},1:{int(vc_tr.loc[1])}}}")
 
+    save_parquet(micro, Path(cfg["paths"]["outputs_dir"]) / "features" / f"{symbol}_micro.parquet")
     micro_full = micro
 
     # ----- Mining / ε -----
@@ -406,18 +430,22 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                 if Wd is not None and np.isfinite(Wd).all():
                     multi_shapelets[h]["discords"].append(Wd)
 
-        # --- Calibrate ε per (horizon, bank) (unchanged) ---
+        # --- Calibrate ε per (horizon, bank) ---
         from src.motifs.mass import zdist_multi
+
+        EPS_MAX = int(cfg["motifs"].get("eps_cal_sample_max", 5000))
+        PCT = float(cfg["motifs"].get("eps_cal_pctile", 15))
+
         def _cal_eps(h, side, kind):
             mats = multi_shapelets[h][side][kind]
-            if len(mats) == 0:
+            if not mats:
                 return 1.0
             feats_h = feats[h].reset_index(drop=True)
             L = cfg["motifs"]["horizons"][h]["L"]
-            end_rows = []
             idx_train = np.where(masks[h]["train"])[0]
-            if len(idx_train) < L:
-                return 1.0  # not enough bars to calibrate
+
+            # gather candidate end rows matching this class
+            end_rows = []
             for e in idx_train:
                 if e < L-1:
                     continue
@@ -427,46 +455,54 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                 msign = _macro_sign_from_window(close_win)
                 cls = None
                 if tb == 1 and msign > 0:
-                    cls=("long","good")
+                    cls = ("long", "good")
                 elif tb == -1 and msign < 0:
-                    cls=("short","good")
+                    cls = ("short", "good")
                 elif tb == -1 and msign > 0:
-                    cls=("long","bad")
+                    cls = ("long", "bad")
                 elif tb == 1 and msign < 0:
-                    cls=("short","bad")
+                    cls = ("short", "bad")
                 if cls == (side, kind):
                     end_rows.append(e)
-            if len(end_rows) > 5000:
-                end_rows = end_rows[::max(1, len(end_rows)//5000)]
+
+            if len(end_rows) > EPS_MAX:
+                step = max(1, len(end_rows) // EPS_MAX)
+                end_rows = end_rows[::step]
+
             dpool = []
             for mat in mats:
                 for e in end_rows:
                     W = _window_LF(feats_h, e, L, feats_list)
-                    if (W is None) or (not np.isfinite(W).all()):
+                    if W is None or not np.isfinite(W).all():
                         continue
                     dpool.append(zdist_multi(mat, W))
-            return float(np.percentile(np.asarray(dpool), 15)) if len(dpool) > 0 else 1.0
+            return float(np.percentile(np.asarray(dpool), PCT)) if dpool else 1.0
 
-        for h in ["macro","meso","micro"]:
-            for side in ["long","short"]:
-                for kind in ["good","bad"]:
+        # logging wrapper
+        for h in ["macro", "meso", "micro"]:
+            for side in ["long", "short"]:
+                for kind in ["good", "bad"]:
+                    n_mats = len(multi_shapelets[h][side][kind])
+                    t0 = time.time()
                     epsilon[h][side][kind] = _cal_eps(h, side, kind)
-            if len(multi_shapelets[h]["discords"]) > 0:
-                epsilon[h]["discords"] = 1.0  # keep loose or compute if desired
+                    print(
+                        f"[EPS] {h}/{side}.{kind}: mats={n_mats} -> eps={epsilon[h][side][kind]:.4f} in {time.time()-t0:.1f}s"
+                    )
+            epsilon[h]["discords"] = 1.0
         _coerce_eps_tree(epsilon)
 
     # --- UPDATE artifact persist to store features + banks (handle persist_artifacts + mine mode) ---
     if persist_artifacts and cfg.get("_phase") == "mine":
-        import pickle, pathlib
-        art_dir = pathlib.Path("artifacts") / fold_id(symbol, train_months, test_months)
+        import pickle
+        art_dir = Path("artifacts") / f"{symbol}_{train_months[-1]}__{test_months[0]}"
         art_dir.mkdir(parents=True, exist_ok=True)
-        artifacts = {"symbol": symbol,
-                     "fold": {"train_end": str(train_months[-1]), "test_start": str(test_months[0])},
-                     "features": feats_list,
-                     "horizons": {}}
+        artifact_dict = {"symbol": symbol,
+                         "fold": {"train_end": str(train_months[-1]), "test_start": str(test_months[0])},
+                         "features": feats_list,
+                         "horizons": {}}
         for h in ["macro", "meso", "micro"]:
             _disc_eps = _as_float(epsilon[h].get("discords", None), 1.0)
-            artifacts["horizons"][h] = {
+            artifact_dict["horizons"][h] = {
                 "L": int(cfg["motifs"]["horizons"][h]["L"]),
                 "classes": {
                     "long":  {"good": {"epsilon": float(epsilon[h]["long"]["good"]),
@@ -483,9 +519,12 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                     "shapelets": [np.asarray(W, dtype=float) for W in multi_shapelets[h]["discords"]]
                 }
             }
-        with open(art_dir / "shapelet_artifacts.pkl", "wb") as f:
-            pickle.dump(artifacts, f, protocol=pickle.HIGHEST_PROTOCOL)
-        print(f"[INFO] persisted artifacts to {art_dir / 'shapelet_artifacts.pkl'}")
+        tmp = art_dir / "shapelet_artifacts.pkl.tmp"
+        out = art_dir / "shapelet_artifacts.pkl"
+        with open(tmp, "wb") as fh:
+            pickle.dump(artifact_dict, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        tmp.replace(out)
+        print(f"[INFO] persisted artifacts to {out}")
         return {"symbol": symbol, "train_months": train_months, "test_months": test_months,
                 "trades": 0, "sum_R": 0.0, "avg_R": 0.0, "median_R": 0.0}
 

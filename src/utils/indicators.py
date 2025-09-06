@@ -305,11 +305,16 @@ def feature_frame(
         df["dollar_volume"] = (df["volume"].astype(float) * df["close"].astype(float))
 
     # tick_imbalance may be all-NaN if tick_buys/tick_sells are absent; keep the rows.
-    df["tick_imbalance"] = tick_imbalance(df).fillna(0.0)
+    df["tick_imbalance"] = tick_imbalance(df)
 
     # finalize: only demand OHLC+ATR; keep rows even if some *features* are NaN
     core = ["open", "high", "low", "close", "atr"]
     df = df.dropna(subset=core).reset_index(drop=True)
+
+    # ensure optional features won’t nuke rows
+    if "tick_imbalance" in df.columns:
+        df["tick_imbalance"] = df["tick_imbalance"].fillna(0.0)
+
     return df
 
 
