@@ -29,6 +29,9 @@ bars:
   micro_tf: "1min"
 
 motifs:
+  # ε calibration speed & tolerance
+  eps_cal_sample_max: 1000   # cap number of train windows sampled per bank for ε (fast)
+  eps_cal_pctile: 20         # looser ε for better matching stability
   # Optional: fix the exact features & order used for multivariate windows
   features:
     - ret_z
