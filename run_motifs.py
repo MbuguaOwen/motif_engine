@@ -565,7 +565,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         if len(d) < L: return None
         return d.iloc[-L:][cols].to_numpy(dtype=float)
 
-    debug_cap = 100  # print first 100 decisions for quick visibility
+    debug_cap = int(cfg.get("ui", {}).get("simulate_debug_first_n", 0))
     dbg_printed = 0
     rej_counts = {"score":0, "bad":0, "margin":0, "macro_req":0, "meso_req":0, "micro_req":0, "discord":0, "ok":0}
 
