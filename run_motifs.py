@@ -70,12 +70,14 @@ def _prep_ohlc_atr_for_labels(df, atr_window):
 
     _coerce_numeric(df, need + (["atr"] if "atr" in df.columns else []))
 
+    # fix inverted high/low
     inv = df["high"] < df["low"]
     if inv.any():
         hi = df.loc[inv, "high"].values
         df.loc[inv, "high"] = df.loc[inv, "low"].values
         df.loc[inv, "low"] = hi
 
+    # ensure ATR exists and is finite-ish
     need_atr = ("atr" not in df.columns) or (~np.isfinite(df["atr"].to_numpy())).all()
     if need_atr:
         prev_close = df["close"].shift(1)
@@ -84,19 +86,22 @@ def _prep_ohlc_atr_for_labels(df, atr_window):
         tr = np.maximum(tr, (df["low"] - prev_close).abs())
         df["atr"] = tr.rolling(int(atr_window), min_periods=1).mean()
 
+    # fill small gaps
     for c in ["open", "high", "low", "close", "volume", "atr"]:
         df[c] = df[c].bfill().ffill()
 
     req = df[["high", "low", "close", "atr"]]
     bad_mask = ~np.isfinite(req.to_numpy(float)).all(axis=1)
     dropped = int(bad_mask.sum())
-    if dropped:
-        df = df.loc[~bad_mask].reset_index(drop=True)
+    if dropped > 0:
+        if dropped == len(df):
+            print(f"[DATA] WARNING: all rows non-finite after cleaning; keeping rows (no drop).")
+            return df.reset_index(drop=True)
         print(f"[DATA] dropped {dropped} non-finite rows before labeling")
+        df = df.loc[~bad_mask].reset_index(drop=True)
 
-    n_flip = int((df["high"] < df["low"]).sum())
-    if n_flip:
-        print(f"[DATA] WARNING: {n_flip} high<low rows after cleaning")
+    if (df["high"] < df["low"]).any():
+        print(f"[DATA] WARNING: high<low rows remain after cleaning")
 
     return df
 
@@ -215,29 +220,14 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             feats[h] = build_feats(bars_1m, tf, atr_win)
             save_parquet(feats[h], fpath)
 
-    # ----- Month masks -----
-    def mask_by_months(df, months):
-        """
-        Return a numpy[bool] mask selecting rows whose timestamp month is in `months`.
-        Uses pandas .isin and returns a real boolean array (no ambiguous truthiness).
-        """
-        m = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m")
-        return m.isin(pd.Index(months)).to_numpy(dtype=bool)
-
-    masks = {h: {"train": mask_by_months(feats[h], train_months),
-                 "test":  mask_by_months(feats[h], test_months)} for h in feats}
-
-    # ----- Triple-barrier on micro (labels) -----
-    # --- Build a clean micro frame for labeling (always) ---
+    # ----- Clean and label micro frame -----
     micro = feats["micro"].copy()
     micro = _prep_ohlc_atr_for_labels(micro, atr_window=int(cfg["bars"]["atr_window"]))
 
-    # Choose eval vs. mining labels
     is_mine_phase = (cfg.get("_phase") == "mine")
     lbl_cfg = cfg["labels_mining"] if (is_mine_phase and "labels_mining" in cfg) else cfg["labels"]
-
     labels = triple_barrier_labels(
-        micro[["open","high","low","close","volume","atr"]],
+        micro[["open", "high", "low", "close", "volume", "atr"]],
         atr_col="atr",
         up_mult=float(lbl_cfg["barrier_up_atr"]),
         dn_mult=float(lbl_cfg["barrier_dn_atr"]),
@@ -246,24 +236,31 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         include_equals=True,
     )
     micro["tb_label"] = labels.values
-    feats["micro"] = micro  # keep in feats map if later logic needs it
-
-    # --- Label audits ---
-    vc_all = pd.Series(micro["tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
-    print(f"[LABELS] phase={('mine' if is_mine_phase else cfg.get('_phase'))} "
-          f"used up={float(lbl_cfg['barrier_up_atr'])} dn={float(lbl_cfg['barrier_dn_atr'])} "
-          f"timeout={int(lbl_cfg['timeout_bars_micro'])} use_high_low=True | "
-          f"counts(all)={{-1:{int(vc_all.loc[-1])},0:{int(vc_all.loc[0])},1:{int(vc_all.loc[1])}}}")
-
-    if is_mine_phase:
-        mtrain = np.asarray(masks['micro']['train']).astype(bool)
-        vc_tr = pd.Series(micro.loc[mtrain, "tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
-        months_train = pd.to_datetime(micro.loc[mtrain, "timestamp"], utc=True, errors="coerce").dt.strftime("%Y-%m")
-        print(f"[LABELS] TRAIN label counts {{-1:{int(vc_tr.loc[-1])},0:{int(vc_tr.loc[0])},1:{int(vc_tr.loc[1])}}} "
-              f"| rows_by_month={months_train.value_counts().sort_index().to_dict()}")
-        if int(vc_tr.loc[-1]) == 0 and int(vc_tr.loc[1]) == 0:
-            print("[WARN] TRAIN labels have no +1/-1 (all timeouts). Raise timeout_bars_mining or ease barriers (e.g., 24/8).")
+    feats["micro"] = micro  # <- replace micro in feats map
     save_parquet(micro, Path(cfg["paths"]["outputs_dir"]) / "features" / f"{symbol}_micro.parquet")
+
+    # ----- Month masks (computed after micro cleaning) -----
+    def mask_by_months(df, months):
+        m = pd.to_datetime(df["timestamp"]).dt.strftime("%Y-%m")
+        return m.isin(pd.Index(months)).to_numpy(bool)
+
+    masks = {
+        h: {
+            "train": mask_by_months(feats[h], train_months),
+            "test": mask_by_months(feats[h], test_months),
+        }
+        for h in feats
+    }
+
+    # (optional) print train label counts for audit in mining phase
+    if is_mine_phase:
+        mtrain = masks["micro"]["train"]
+        vc_tr = pd.Series(micro.loc[mtrain, "tb_label"]).value_counts().reindex([-1, 0, 1], fill_value=0)
+        by_mon = pd.to_datetime(micro.loc[mtrain, "timestamp"]).dt.strftime("%Y-%m").value_counts().sort_index().to_dict()
+        print(f"[LABELS] TRAIN label counts {{-1:{int(vc_tr[-1])},0:{int(vc_tr[0])},1:{int(vc_tr[1])}}} | rows_by_month={by_mon}")
+        if vc_tr[1] == 0 and vc_tr[-1] == 0:
+            print("[WARN] TRAIN labels have no +1/-1. Consider easier mining labels (e.g., up/dn=24/8, timeout=1440).")
+
     micro_full = micro
 
     # ----- Mining / ε -----
