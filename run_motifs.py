@@ -1,6 +1,8 @@
 import argparse, json
 from pathlib import Path
-import numpy as np, pandas as pd, yaml
+import numpy as np
+import pandas as pd
+import yaml
 
 # --- epsilon helpers ---
 
@@ -194,6 +196,14 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
         include_equals=True,
     )
     micro["tb_label"] = labels.values
+    # --- Label sanity (all rows) ---
+    try:
+        _vc_all = pd.Series(micro["tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+        print(f"[LABELS] phase={cfg.get('_phase')} used up={float(lbl_cfg['barrier_up_atr'])} "
+              f"dn={float(lbl_cfg['barrier_dn_atr'])} timeout={int(lbl_cfg['timeout_bars_micro'])} "
+              f"use_high_low=True | counts(all)={{-1:{int(_vc_all.loc[-1])},0:{int(_vc_all.loc[0])},1:{int(_vc_all.loc[1])}}}")
+    except Exception as _e:
+        print(f"[LABELS] count error (all): {_e}")
     save_parquet(micro, Path(cfg["paths"]["outputs_dir"]) / "features" / f"{symbol}_micro.parquet")
     feats["micro"] = micro
     micro_full = micro
@@ -235,6 +245,30 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             feats_list = _pick_features(feats["micro"], cfg)
     else:
         # Fresh mining from TRAIN months (keep 1-D candidate enumeration for speed)
+        # --- Basic data integrity checks ---
+        try:
+            md = feats["micro"][["high", "low", "atr"]]
+            n_nan = int((~np.isfinite(md.to_numpy(float))).sum())
+            n_flip = int((feats["micro"]["high"] < feats["micro"]["low"]).sum())
+            if n_nan > 0 or n_flip > 0:
+                print(f"[DATA] anomalies: non-finite(OHLC/ATR)={n_nan}, high<low rows={n_flip}")
+        except Exception as _e:
+            print(f"[DATA] integrity check error: {_e}")
+
+        # --- Train-only label audit BEFORE mining begins ---
+        try:
+            micro_df = feats["micro"].reset_index(drop=True)
+            ts = pd.to_datetime(micro_df["timestamp"], utc=True, errors="coerce")
+            mtrain = np.asarray(masks["micro"]["train"]).astype(bool)
+            vc_train = pd.Series(micro_df.loc[mtrain, "tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+            months_train = ts.loc[mtrain].dt.strftime("%Y-%m")
+            months_map = months_train.value_counts().sort_index().to_dict()
+            print(f"[LABELS] TRAIN label counts {{-1:{int(vc_train.loc[-1])},0:{int(vc_train.loc[0])},1:{int(vc_train.loc[1])}}} "
+                  f"| rows_by_month={months_map}")
+            if int(vc_train.loc[1]) == 0 and int(vc_train.loc[-1]) == 0:
+                print("[WARN] TRAIN labels have no +1/-1 (all timeouts). Consider raising timeout_bars or using labels_mining (e.g., 30/10, 1440).")
+        except Exception as _e:
+            print(f"[LABELS] train-audit error: {_e}")
         motif_starts = {}     # keep motif start indices per horizon
         discord_starts = {}   # NEW: keep discord start indices per horizon
 
@@ -636,13 +670,22 @@ def main():
                 # Triple-barrier labels on micro (unchanged logic)
                 micro = load_parquet(feats_dir / f"{sym}_micro.parquet")
                 micro["atr"] = micro["atr"].bfill().ffill()
+                lbl_cfg = cfg["labels"]
                 micro["tb_label"] = triple_barrier_labels(
                     micro[["open", "high", "low", "close", "volume", "atr"]],
                     atr_col="atr",
-                    up_mult=cfg["labels"]["barrier_up_atr"],
-                    dn_mult=cfg["labels"]["barrier_dn_atr"],
-                    timeout_bars=cfg["labels"]["timeout_bars_micro"],
+                    up_mult=lbl_cfg["barrier_up_atr"],
+                    dn_mult=lbl_cfg["barrier_dn_atr"],
+                    timeout_bars=lbl_cfg["timeout_bars_micro"],
                 ).values
+                # --- Label sanity (all rows) ---
+                try:
+                    _vc_all = pd.Series(micro["tb_label"]).value_counts().reindex([-1,0,1], fill_value=0)
+                    print(f"[LABELS] phase={cfg.get('_phase')} used up={float(lbl_cfg['barrier_up_atr'])} "
+                          f"dn={float(lbl_cfg['barrier_dn_atr'])} timeout={int(lbl_cfg['timeout_bars_micro'])} "
+                          f"use_high_low=True | counts(all)={{-1:{int(_vc_all.loc[-1])},0:{int(_vc_all.loc[0])},1:{int(_vc_all.loc[1])}}}")
+                except Exception as _e:
+                    print(f"[LABELS] count error (all): {_e}")
                 save_parquet(micro, feats_dir / f"{sym}_micro.parquet")
 
         elif args.mode in ("mine", "simulate", "walkforward"):
