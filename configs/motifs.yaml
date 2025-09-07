@@ -67,44 +67,44 @@ motifs:
 
 # === GATE: trend aligned + K-of-N + GOOD vs BAD ===
 gating:
-  # Side selection: follow macro regime
-  pick_side: "macro_sign"          # long in macro-up, short in macro-down
-  long_only_if_macro_up:  true     # hard guard
-  short_only_if_macro_dn: true     # hard guard
+  # Trend guard (keep!)
+  pick_side: "macro_sign"
+  long_only_if_macro_up:  true
+  short_only_if_macro_dn: true
 
-  # Use K-of-N horizons (soft). Remove hard per-horizon vetoes.
+  # Loosen agreement a bit: let GOOD+margin do the filtering
   require_macro: false
   require_meso:  false
   require_micro: false
-  require_at_least_k_of: 2         # any 2 of {macro, meso, micro} must pass
+  require_at_least_k_of: 1        # was 2
 
-  # Per-horizon minimums (meso/macro tend to score lower than micro)
+  # Softer per-horizon floors; micro is naturally stronger, macro weakest
   score_min_per_horizon:
-    macro: 0.03
-    meso:  0.06
-    micro: 0.10
+    macro: 0.03                    # was 0.30
+    meso:  0.05                    # was 0.32
+    micro: 0.08                    # was 0.34
 
-  # Composite quality bar (uses horizon weights above)
-  score_min: 0.18
+  # Composite bar (weighted by horizon weights). Modestly strict.
+  score_min: 0.20                  # was 0.35
 
-  # Favor GOOD and penalize BAD
-  alpha: 0.45                       # margin penalty weight on BAD
-  margin_min: 0.04                  # require (best_good - α·best_bad) ≥ margin_min
-  bad_max: 0.70                     # hard veto if any BAD(h) ≥ bad_max
+  # GOOD vs BAD selectivity (keep strong)
+  alpha: 0.50
+  margin_min: 0.05
+  bad_max: 0.70
 
   # Hygiene
-  discord_block_min: 0.995          # block if any discord(h) ≥ this
-  cooldown_bars: 120                # reduce clustering
+  discord_block_min: 0.995
+  cooldown_bars: 120
 
 risk:
   sl_mult: 20.0
-  tp_mult: 60.0
-  be_at_R: 0.65
+  tp_mult: 80.0                    # was 60 — allow 4R topside
+  be_at_R: 0.50                    # was 0.65 — turn near-wins into ≥0R
   tsl:
-    atr_mult: 20
-    floor_from_median_mult: 1.1
-    arm_after_secs: 15
-    min_secs_between_steps: 20
+    atr_mult: 18                   # was 20 — trail a touch tighter
+    floor_from_median_mult: 1.15   # was 1.10 — protect when choppy
+    arm_after_secs: 60             # was 15 — avoid micro-chop arming
+    min_secs_between_steps: 45     # was 20 — reduce trail churn
     quantize_price: true
 
 ui:
