@@ -593,13 +593,11 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             macro_row = macro_full[macro_full["timestamp"] <= ts].iloc[-1]
             macro_up = bool(macro_row.get("tsmom_slope_z", 0.0) >= 0.0)
         except Exception:
-            pass
-        if macro_up is None:
             try:
                 micro_row = micro_test.loc[i]
                 macro_up = bool(micro_row.get("tsmom_slope_z", 0.0) >= 0.0)
             except Exception:
-                macro_up = None  # no regime info; gate will skip trend veto
+                macro_up = None  # no regime signal available
 
         wins = {
             "micro": slice_LF_asof(micro_full, ts, Ls["micro"], feats_list),
@@ -690,7 +688,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
                         "entry": entry, "R": float(R), "hold_bars": int(hold)})
         cooldown = cooldown_bars
 
-    print("[SIMDBG] decision summary:", rej_counts)
+    print("[SIMDBG] decision summary:", dict(sorted(rej_counts.items())))
 
     R_list = [x["R"] for x in results]
     summary = {"symbol": symbol, "train_months": train_months, "test_months": test_months,
