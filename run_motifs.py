@@ -567,7 +567,8 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
 
     debug_cap = int(cfg.get("ui", {}).get("simulate_debug_first_n", 0))
     dbg_printed = 0
-    rej_counts = {"score":0, "bad":0, "margin":0, "macro_req":0, "meso_req":0, "micro_req":0, "discord":0, "ok":0}
+    rej_counts = {"trend_guard":0, "macro_req":0, "meso_req":0, "micro_req":0, "k_of_n":0,
+                  "bad":0, "score":0, "margin":0, "discord":0, "ok":0}
 
     def _dbg(msg):
         nonlocal dbg_printed
@@ -586,6 +587,19 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             cooldown -= 1
             continue
         ts = micro_test.loc[i, "timestamp"]
+
+        macro_up = None
+        try:
+            macro_row = macro_full[macro_full["timestamp"] <= ts].iloc[-1]
+            macro_up = bool(macro_row.get("tsmom_slope_z", 0.0) >= 0.0)
+        except Exception:
+            pass
+        if macro_up is None:
+            try:
+                micro_row = micro_test.loc[i]
+                macro_up = bool(micro_row.get("tsmom_slope_z", 0.0) >= 0.0)
+            except Exception:
+                macro_up = None  # no regime info; gate will skip trend veto
 
         wins = {
             "micro": slice_LF_asof(micro_full, ts, Ls["micro"], feats_list),
@@ -622,7 +636,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             if len(class_matchers.get("discords", {})) > 0:
                 discord_scores = {h: float(class_matchers["discords"][h].match_score(wins[h])[0]) for h in ["macro", "meso", "micro"]}
 
-            decision = passes_gate(Sg, Sb, discord_scores, cfg, debug=True)
+            decision = passes_gate(side, Sg, Sb, discord_scores, cfg, macro_up=macro_up)
             rej_counts["ok" if decision.ok else decision.reason] += 1
 
             if not decision.ok:
@@ -652,7 +666,7 @@ def run_fold(cfg, symbol, train_months, test_months, cli_disable=False,
             Sb = {"macro": 0.0, "meso": 0.0, "micro": 0.0}
             discord_scores = {}
 
-            decision = passes_gate(Sg, Sb, discord_scores, cfg, debug=True)
+            decision = passes_gate(side, Sg, Sb, discord_scores, cfg, macro_up=macro_up)
             rej_counts["ok" if decision.ok else decision.reason] += 1
 
             if not decision.ok:
