@@ -76,7 +76,7 @@ motifs:
       keep: 80
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
-      weight: 0.40        # give meso more say
+      weight: 0.30
       freshness_bars: 15
     micro:
       L: 30
@@ -84,21 +84,32 @@ motifs:
       keep: 300
       candidate_stride: 1
       hit_eps_pct_range: [5, 25]
-      weight: 0.40        # take a little from micro
+      weight: 0.50
       freshness_bars: 5
 
 gating:
-  require_macro: false     # was true
-  require_meso:  true      # require alignment on meso
-  require_micro: true      # ...and micro
-  # match scores from MultiShapeletMatcher are typically ~0.05–0.30
-  score_min: 0.28          # tighter quality bar (was ~0.12–0.20)
-  pick_side: "argmax"
-  bad_max: 0.80            # earlier bad veto (was 0.95)
-  alpha: 0.30              # penalize BAD in margin more
-  margin_min: 0.02         # require positive (S_good - alpha*S_bad)
-  discord_block_min: 0.995
-  cooldown_bars: 120       # cut over-trading
+  # SIDE CONTROL (trend aligned)
+  pick_side: "macro_sign"        # long in macro-up regime, short in macro-down
+  long_only_if_macro_up:  true   # hard veto longs when macro is down
+  short_only_if_macro_dn: true   # hard veto shorts when macro is up
+
+  # HORIZON AGREEMENT
+  require_macro: false
+  require_meso:  false
+  require_micro: true
+  require_at_least_k_of: 2       # K-of-N horizons must clear their thresholds
+  score_min_per_horizon:         # per-horizon gates (meso typically scores lower)
+    macro: 0.10
+    meso:  0.10
+    micro: 0.22
+
+  # GLOBAL SELECTIVITY (composite + margin + BAD)
+  score_min: 0.28                # composite quality bar (weights above)
+  margin_min: 0.05               # require S_good - alpha * S_bad ≥ margin_min
+  alpha: 0.40                    # weight of BAD in margin
+  bad_max: 0.75                  # hard veto if any BAD(h) ≥ bad_max
+  discord_block_min: 0.995       # block if any horizon discord ≥ this
+  cooldown_bars: 180             # reduce clustering
 
 risk:
   sl_mult: 20.0
@@ -115,4 +126,4 @@ ui:
   progress: true
   progress_ascii: true
   progress_mininterval: 0.2
-  simulate_debug_first_n: 0   # 0 = don’t print per-minute decisions
+  simulate_debug_first_n: 0      # no per-bar spam; we print a summary per fold
