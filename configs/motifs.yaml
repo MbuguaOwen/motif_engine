@@ -76,20 +76,20 @@ gating:
   require_macro: false
   require_meso:  false
   require_micro: false
-  require_at_least_k_of: 1        # was 2
+  require_at_least_k_of: 2
 
   # Softer per-horizon floors; micro is naturally stronger, macro weakest
   score_min_per_horizon:
-    macro: 0.03                    # was 0.30
-    meso:  0.05                    # was 0.32
-    micro: 0.08                    # was 0.34
+    macro: 0.03
+    meso:  0.06
+    micro: 0.10
 
   # Composite bar (weighted by horizon weights). Modestly strict.
-  score_min: 0.20                  # was 0.35
+  score_min: 0.18
 
   # GOOD vs BAD selectivity (keep strong)
-  alpha: 0.50
-  margin_min: 0.05
+  alpha: 0.45
+  margin_min: 0.04
   bad_max: 0.70
 
   # Hygiene

@@ -1,0 +1,14 @@
+{
+  "symbol": "BTCUSDT",
+  "train_months": [
+    "2025-02",
+    "2025-03"
+  ],
+  "test_months": [
+    "2025-01"
+  ],
+  "trades": 0,
+  "sum_R": 0.0,
+  "avg_R": 0.0,
+  "median_R": 0.0
+}
