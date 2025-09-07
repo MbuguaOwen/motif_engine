@@ -28,11 +28,9 @@ bars:
   meso_tf: "15min"
   micro_tf: "1min"
 
+# === MOTIF HORIZONS & WEIGHTS ===
 motifs:
-  # ε calibration speed & tolerance
-  eps_cal_sample_max: 1000   # cap number of train windows sampled per bank for ε (fast)
-  eps_cal_pctile: 20         # looser ε for better matching stability
-  # Optional: fix the exact features & order used for multivariate windows
+  # Fixed feature set for multivariate windows (must match mining)
   features:
     - ret_z
     - tsmom_slope_z
@@ -61,55 +59,42 @@ motifs:
     - kama_slope
     - volume_z
     - tick_imbalance
+
   horizons:
-    macro:
-      L: 40
-      top_k: 120
-      keep: 40
-      candidate_stride: 1
-      hit_eps_pct_range: [5, 25]
-      weight: 0.20
-      freshness_bars: 12
-    meso:
-      L: 60
-      top_k: 240
-      keep: 80
-      candidate_stride: 1
-      hit_eps_pct_range: [5, 25]
-      weight: 0.30
-      freshness_bars: 15
-    micro:
-      L: 30
-      top_k: 1200
-      keep: 300
-      candidate_stride: 1
-      hit_eps_pct_range: [5, 25]
-      weight: 0.50
-      freshness_bars: 5
+    macro: { L: 40,  top_k: 120,  keep: 40,  candidate_stride: 1, hit_eps_pct_range: [5,25], weight: 0.50, freshness_bars: 12 }
+    meso:  { L: 60,  top_k: 240,  keep: 80,  candidate_stride: 1, hit_eps_pct_range: [5,25], weight: 0.30, freshness_bars: 15 }
+    micro: { L: 30,  top_k: 1200, keep: 300, candidate_stride: 1, hit_eps_pct_range: [5,25], weight: 0.20, freshness_bars: 5 }
 
+# === GATE: trend aligned + K-of-N + GOOD vs BAD ===
 gating:
-  # SIDE CONTROL (trend aligned)
-  pick_side: "macro_sign"        # long in macro-up regime, short in macro-down
-  long_only_if_macro_up:  true   # hard veto longs when macro is down
-  short_only_if_macro_dn: true   # hard veto shorts when macro is up
+  # Side selection: follow macro regime
+  pick_side: "macro_sign"          # long in macro-up, short in macro-down
+  long_only_if_macro_up:  true     # hard guard
+  short_only_if_macro_dn: true     # hard guard
 
-  # HORIZON AGREEMENT
+  # Use K-of-N horizons (soft). Remove hard per-horizon vetoes.
   require_macro: false
   require_meso:  false
-  require_micro: true
-  require_at_least_k_of: 2       # K-of-N horizons must clear their thresholds
-  score_min_per_horizon:         # per-horizon gates (meso typically scores lower)
-    macro: 0.10
-    meso:  0.10
-    micro: 0.22
+  require_micro: false
+  require_at_least_k_of: 2         # any 2 of {macro, meso, micro} must pass
 
-  # GLOBAL SELECTIVITY (composite + margin + BAD)
-  score_min: 0.28                # composite quality bar (weights above)
-  margin_min: 0.05               # require S_good - alpha * S_bad ≥ margin_min
-  alpha: 0.40                    # weight of BAD in margin
-  bad_max: 0.75                  # hard veto if any BAD(h) ≥ bad_max
-  discord_block_min: 0.995       # block if any horizon discord ≥ this
-  cooldown_bars: 180             # reduce clustering
+  # Per-horizon minimums (meso/macro tend to score lower than micro)
+  score_min_per_horizon:
+    macro: 0.03
+    meso:  0.06
+    micro: 0.10
+
+  # Composite quality bar (uses horizon weights above)
+  score_min: 0.18
+
+  # Favor GOOD and penalize BAD
+  alpha: 0.45                       # margin penalty weight on BAD
+  margin_min: 0.04                  # require (best_good - α·best_bad) ≥ margin_min
+  bad_max: 0.70                     # hard veto if any BAD(h) ≥ bad_max
+
+  # Hygiene
+  discord_block_min: 0.995          # block if any discord(h) ≥ this
+  cooldown_bars: 120                # reduce clustering
 
 risk:
   sl_mult: 20.0
